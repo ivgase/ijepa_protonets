@@ -24,8 +24,63 @@ parser.add_argument(
     '--devices', type=str, nargs='+', default=['cuda:0'],
     help='which devices to use on local machine')
 
+# -- CLI overrides (applied on top of YAML) --------------------------------
+parser.add_argument('--tag', type=str, default=None,
+                    help='Override logging.write_tag (experiment name)')
+parser.add_argument('--folder', type=str, default=None,
+                    help='Override logging.folder (output directory)')
+parser.add_argument('--lr', type=float, default=None,
+                    help='Override optimization.lr')
+parser.add_argument('--epochs', type=int, default=None,
+                    help='Override optimization.epochs')
+parser.add_argument('--batch_size', type=int, default=None,
+                    help='Override data.batch_size')
+parser.add_argument('--warmup', type=int, default=None,
+                    help='Override optimization.warmup')
+parser.add_argument('--model_name', type=str, default=None,
+                    help='Override meta.model_name')
+parser.add_argument('--patch_size', type=int, default=None,
+                    help='Override mask.patch_size')
+parser.add_argument('--wandb_name', type=str, default=None,
+                    help='Override wandb.name')
+parser.add_argument('--wandb_project', type=str, default=None,
+                    help='Override wandb.project')
+parser.add_argument('--no_wandb', action='store_true',
+                    help='Disable wandb')
+parser.add_argument('--probe_freq', type=int, default=None,
+                    help='Override probe.freq (0 = disabled)')
 
-def process_main(rank, fname, world_size, devices):
+
+def apply_overrides(params, args):
+    """Apply CLI overrides on top of YAML params."""
+    if args.tag is not None:
+        params['logging']['write_tag'] = args.tag
+    if args.folder is not None:
+        params['logging']['folder'] = args.folder
+    if args.lr is not None:
+        params['optimization']['lr'] = args.lr
+    if args.epochs is not None:
+        params['optimization']['epochs'] = args.epochs
+    if args.batch_size is not None:
+        params['data']['batch_size'] = args.batch_size
+    if args.warmup is not None:
+        params['optimization']['warmup'] = args.warmup
+    if args.model_name is not None:
+        params['meta']['model_name'] = args.model_name
+    if args.patch_size is not None:
+        params['mask']['patch_size'] = args.patch_size
+    if args.no_wandb:
+        params.setdefault('wandb', {})['enable'] = False
+    if args.wandb_name is not None:
+        params.setdefault('wandb', {})['name'] = args.wandb_name
+    if args.wandb_project is not None:
+        params.setdefault('wandb', {})['project'] = args.wandb_project
+    if args.probe_freq is not None:
+        params.setdefault('probe', {})['freq'] = args.probe_freq
+    return params
+
+
+def process_main(rank, fname, world_size, devices, cli_args):
     import os
     os.environ['CUDA_VISIBLE_DEVICES'] = str(devices[rank].split(':')[-1])
 
@@ -43,6 +98,11 @@ def process_main(rank, fname, world_size, devices):
     params = None
     with open(fname, 'r') as y_file:
         params = yaml.load(y_file, Loader=yaml.FullLoader)
+
+    # -- apply CLI overrides
+    params = apply_overrides(params, cli_args)
+
+    if rank == 0:
         logger.info('loaded params...')
         pp = pprint.PrettyPrinter(indent=4)
         pp.pprint(params)
@@ -61,5 +121,5 @@ if __name__ == '__main__':
     for rank in range(num_gpus):
         mp.Process(
             target=process_main,
-            args=(rank, args.fname, num_gpus, args.devices)
+            args=(rank, args.fname, num_gpus, args.devices, args)
         ).start()

@@ -24,8 +24,19 @@ def make_transforms(
     color_distortion=False,
     gaussian_blur=False,
     normalization=((0.485, 0.456, 0.406),
-                   (0.229, 0.224, 0.225))
+                   (0.229, 0.224, 0.225)),
+    in_chans=3,
+    norm_stats=None
 ):
+    if in_chans == 1:
+        # GADF: solo normalización (dataset ya retorna tensores)
+        logger.info('making GADF data transforms (Normalize only)')
+        if norm_stats is None:
+            norm_stats = ((-0.0000,), (0.5922,))
+        return transforms.Compose([
+            transforms.Normalize(norm_stats[0], norm_stats[1])
+        ])
+
     logger.info('making imagenet data transforms')
 
     def get_color_distortion(s=1.0):

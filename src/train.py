@@ -20,11 +20,13 @@ except Exception:
 import copy
 import logging
 import sys
+import time
 import yaml
 
 import numpy as np
 
 import torch
+import torch.nn as nn
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
@@ -42,6 +44,7 @@ from src.utils.logging import (
     AverageMeter)
 from src.utils.tensors import repeat_interleave_batch
 from src.datasets.imagenet1k import make_imagenet1k
+from src.datasets.gadf_dataset import make_gadf
 
 from src.helper import (
     load_checkpoint,
@@ -62,6 +65,185 @@ torch.backends.cudnn.benchmark = True
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
+
+
+# ---------------------------------------------------------------------------
+# Online linear probe evaluator (GADF 2D)
+# ---------------------------------------------------------------------------
+
+class LinearProbeEvaluator:
+    """Pre-loads val-split tasks and runs quick linear probes on frozen encoder.
+
+    All tasks from the 'val' split of splits.csv are loaded once at init.
+    Spectra are converted to GADF 2D images once and cached in CPU memory.
+    Support/query samples are drawn with a fixed seed so that every call to
+    ``evaluate()`` uses the exact same data.
+    """
+
+    def __init__(self, data_path, image_size=224, norm_stats=None,
+                 k_spt=25, k_qry=25, probe_epochs=50, device='cpu'):
+        import pandas as pd
+        from sklearn.preprocessing import StandardScaler
+        from pyts.image import GramianAngularField
+        self._StandardScaler = StandardScaler
+
+        self.probe_epochs = probe_epochs
+        self.device = device
+        self.image_size = image_size
+        self.norm_stats = norm_stats
+        self.tasks = []  # list of (name, supp_x, supp_y, query_x, query_y)
+
+        splits_file = os.path.join(data_path, 'splits.csv')
+        if not os.path.exists(splits_file):
+            logger.warning(f'No splits.csv at {data_path} — probe disabled')
+            return
+
+        splits_df = pd.read_csv(splits_file, index_col=0)
+        val_tasks = sorted(splits_df[splits_df['split'] == 'val']['task'].tolist())
+
+        logger.info(f'Loading {len(val_tasks)} probe tasks from val split...')
+        rng = np.random.RandomState(42)  # fixed seed — same across experiments
+        gaf = GramianAngularField(image_size=image_size, method='difference')
+
+        for tname in val_tasks:
+            task_dir = os.path.join(data_path, tname)
+            if not os.path.isdir(task_dir):
+                continue
+            try:
+                t = self._load_task(task_dir, tname, k_spt, k_qry, rng, gaf)
+                if t is not None:
+                    self.tasks.append(t)
+            except Exception as e:
+                logger.warning(f'  Skipping probe task {tname}: {e}')
+
+        logger.info(f'Probe evaluator ready: {len(self.tasks)} tasks loaded')
+
+    def _load_task(self, task_dir, name, k_spt, k_qry, rng, gaf):
+        """Load a single task: read CSV, convert to GADF, scale y, sample."""
+        import pandas as pd
+
+        X_supp = pd.read_csv(os.path.join(task_dir, 'X_supp.csv'), index_col=0)
+        y_supp = pd.read_csv(os.path.join(task_dir, 'y_supp.csv'), index_col=0)
+        X_query = pd.read_csv(os.path.join(task_dir, 'X_query.csv'), index_col=0)
+        y_query = pd.read_csv(os.path.join(task_dir, 'y_query.csv'), index_col=0)
+
+        # Use first numeric column as target
+        num_cols = y_supp.select_dtypes(include=[np.number]).columns
+        if len(num_cols) == 0:
+            return None
+        col = num_cols[0]
+        ys = y_supp[col]
+        yq = y_query[col]
+
+        # Drop NaN targets
+        supp_valid = ~ys.isna()
+        query_valid = ~yq.isna()
+        X_supp = X_supp[supp_valid].values.astype(np.float32)
+        ys = ys[supp_valid].values.astype(np.float32)
+        X_query = X_query[query_valid].values.astype(np.float32)
+        yq = yq[query_valid].values.astype(np.float32)
+
+        if len(ys) < 2 or len(yq) < 2:
+            return None
+
+        # Scale y (fit on support)
+        y_scaler = self._StandardScaler()
+        ys = y_scaler.fit_transform(ys.reshape(-1, 1)).flatten()
+        yq = y_scaler.transform(yq.reshape(-1, 1)).flatten()
+
+        # Sample fixed support/query subsets (deterministic via rng)
+        n_spt = min(k_spt, len(ys))
+        n_qry = min(k_qry, len(yq))
+        spt_idx = rng.choice(len(ys), n_spt, replace=False)
+        qry_idx = rng.choice(len(yq), n_qry, replace=False)
+
+        # Convert sampled spectra → GADF 2D images [N, 1, H, W]
+        supp_gadf = gaf.transform(X_supp[spt_idx])  # [n_spt, H, W]
+        query_gadf = gaf.transform(X_query[qry_idx])  # [n_qry, H, W]
+
+        sx = torch.from_numpy(supp_gadf.astype(np.float32)).unsqueeze(1)
+        qx = torch.from_numpy(query_gadf.astype(np.float32)).unsqueeze(1)
+
+        # Normalize GADF (same stats as pretraining)
+        if self.norm_stats is not None:
+            mean = torch.tensor(self.norm_stats[0]).view(1, 1, 1, 1)
+            std = torch.tensor(self.norm_stats[1]).view(1, 1, 1, 1)
+            sx = (sx - mean) / std
+            qx = (qx - mean) / std
+
+        sy = torch.from_numpy(ys[spt_idx]).unsqueeze(1)
+        qy = torch.from_numpy(yq[qry_idx]).unsqueeze(1)
+
+        return (name, sx, sy, qx, qy)
+
+    def evaluate(self, target_encoder, device):
+        """Run linear probe on all tasks. Returns dict of mean metrics."""
+        if not self.tasks:
+            return {}
+
+        from sklearn.metrics import r2_score
+
+        # Unwrap DDP if needed
+        encoder = target_encoder.module if hasattr(target_encoder, 'module') else target_encoder
+        encoder.eval()
+
+        r2_list = []
+        rmse_list = []
+
+        for name, sx, sy, qx, qy in self.tasks:
+            # Extract features with frozen encoder (no grad)
+            with torch.no_grad():
+                supp_feats = encoder(sx.to(device)).mean(dim=1).detach()
+                query_feats = encoder(qx.to(device)).mean(dim=1).detach()
+            supp_y = sy.to(device)
+            query_y = qy.to(device)
+
+            # Train linear head
+            D = supp_feats.shape[1]
+            head = nn.Linear(D, 1).to(device)
+            opt = torch.optim.Adam(head.parameters(), lr=1e-3)
+            loss_fn = nn.MSELoss()
+
+            best_val_loss = float('inf')
+            patience_counter = 0
+            best_pred = None
+
+            for _ in range(self.probe_epochs):
+                head.train()
+                pred = head(supp_feats)
+                loss = loss_fn(pred, supp_y)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+                head.eval()
+                with torch.no_grad():
+                    val_pred = head(query_feats)
+                    val_loss = loss_fn(val_pred, query_y).item()
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_pred = val_pred.cpu().numpy().flatten()
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= 10:
+                        break
+
+            # Metrics
+            y_true = query_y.cpu().numpy().flatten()
+            r2 = r2_score(y_true, best_pred)
+            rmse = np.sqrt(best_val_loss)
+            r2_list.append(r2)
+            rmse_list.append(rmse)
+
+        return {
+            'probe/r2_mean': np.mean(r2_list),
+            'probe/r2_std': np.std(r2_list),
+            'probe/rmse_mean': np.mean(rmse_list),
+            'probe/rmse_std': np.std(rmse_list),
+            'probe/n_tasks': len(self.tasks),
+        }
 
 
 def main(args, resume_preempt=False):
@@ -85,6 +267,7 @@ def main(args, resume_preempt=False):
         torch.cuda.set_device(device)
 
     # -- DATA
+    dataset_type = args['data'].get('dataset_type', 'imagenet')
     use_gaussian_blur = args['data']['use_gaussian_blur']
     use_horizontal_flip = args['data']['use_horizontal_flip']
     use_color_distortion = args['data']['use_color_distortion']
@@ -122,8 +305,33 @@ def main(args, resume_preempt=False):
     final_lr = args['optimization']['final_lr']
 
     # -- LOGGING
-    folder = args['logging']['folder']
+    base_folder = args['logging']['folder']
     tag = args['logging']['write_tag']
+
+    # Auto-create timestamped subfolder: logs/gadf_soil_nir/gadf_jepa_20260311_143022/
+    # When resuming, reuse the folder from read_checkpoint if it's a full path
+    from datetime import datetime
+    if load_model and r_file is not None and os.path.isabs(r_file):
+        # Absolute checkpoint path → save new outputs next to it
+        folder = os.path.dirname(r_file)
+    else:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        folder = os.path.join(base_folder, f'{tag}_{timestamp}')
+    os.makedirs(folder, exist_ok=True)
+
+    # -- WANDB
+    wandb_cfg = args.get('wandb', {})
+    use_wandb = wandb_cfg.get('enable', False)
+    wandb_project = wandb_cfg.get('project', 'ijepa-gadf2d')
+    wandb_name = wandb_cfg.get('name', None)
+
+    # -- PROBE
+    probe_cfg = args.get('probe', {})
+    probe_freq = probe_cfg.get('freq', 0)
+    probe_data_path = probe_cfg.get('data_path', '')
+    probe_k_spt = probe_cfg.get('k_spt', 25)
+    probe_k_qry = probe_cfg.get('k_qry', 25)
+    probe_epochs = probe_cfg.get('epochs', 50)
 
     dump = os.path.join(folder, 'params-ijepa.yaml')
     with open(dump, 'w') as f:
@@ -141,13 +349,30 @@ def main(args, resume_preempt=False):
     if rank > 0:
         logger.setLevel(logging.ERROR)
 
+    # -- W&B (rank 0 only)
+    if use_wandb and rank == 0:
+        try:
+            import wandb
+            if wandb_name is None:
+                wandb_name = f'{tag}_{model_name}_ps{patch_size}_bs{batch_size}'
+            wandb.init(project=wandb_project, name=wandb_name, config=args)
+        except Exception as e:
+            logger.warning(f'W&B init failed ({e}). Disabling wandb.')
+            use_wandb = False
+    else:
+        use_wandb = use_wandb and (rank == 0)
+
     # -- log/checkpointing paths
     log_file = os.path.join(folder, f'{tag}_r{rank}.csv')
     save_path = os.path.join(folder, f'{tag}' + '-ep{epoch}.pth.tar')
     latest_path = os.path.join(folder, f'{tag}-latest.pth.tar')
     load_path = None
     if load_model:
-        load_path = os.path.join(folder, r_file) if r_file is not None else latest_path
+        if r_file is not None:
+            # Support absolute paths and paths relative to base_folder
+            load_path = r_file if os.path.isabs(r_file) else os.path.join(base_folder, r_file)
+        else:
+            load_path = latest_path
 
     # -- make csv_logger
     csv_logger = CSVLogger(log_file,
@@ -159,13 +384,15 @@ def main(args, resume_preempt=False):
                            ('%d', 'time (ms)'))
 
     # -- init model
+    in_chans = 1 if dataset_type == 'gadf' else 3
     encoder, predictor = init_model(
         device=device,
         patch_size=patch_size,
         crop_size=crop_size,
         pred_depth=pred_depth,
         pred_emb_dim=pred_emb_dim,
-        model_name=model_name)
+        model_name=model_name,
+        in_chans=in_chans)
     target_encoder = copy.deepcopy(encoder)
 
     # -- make data transforms
@@ -178,7 +405,8 @@ def main(args, resume_preempt=False):
         nenc=num_enc_masks,
         npred=num_pred_masks,
         allow_overlap=allow_overlap,
-        min_keep=min_keep)
+        min_keep=min_keep,
+        symmetric_masking=(dataset_type == 'gadf'))
 
     transform = make_transforms(
         crop_size=crop_size,
@@ -186,10 +414,24 @@ def main(args, resume_preempt=False):
         gaussian_blur=use_gaussian_blur,
         horizontal_flip=use_horizontal_flip,
         color_distortion=use_color_distortion,
-        color_jitter=color_jitter)
+        color_jitter=color_jitter,
+        in_chans=in_chans,
+        norm_stats=((-0.0000,), (0.5922,)) if dataset_type == 'gadf' else None)
 
     # -- init data-loaders/samplers
-    _, unsupervised_loader, unsupervised_sampler = make_imagenet1k(
+    if dataset_type == 'gadf':
+        _, unsupervised_loader, unsupervised_sampler = make_gadf(
+            transform=transform,
+            batch_size=batch_size,
+            collator=mask_collator,
+            pin_mem=pin_mem,
+            num_workers=num_workers,
+            world_size=world_size,
+            rank=rank,
+            h5_path=args['data']['gadf_h5_path'],
+            drop_last=True)
+    else:
+        _, unsupervised_loader, unsupervised_sampler = make_imagenet1k(
             transform=transform,
             batch_size=batch_size,
             collator=mask_collator,
@@ -203,6 +445,22 @@ def main(args, resume_preempt=False):
             copy_data=copy_data,
             drop_last=True)
     ipe = len(unsupervised_loader)
+
+    # -- Online linear probe evaluator (rank 0 only)
+    probe_evaluator = None
+    if probe_freq > 0 and rank == 0 and dataset_type == 'gadf':
+        norm_stats_probe = ((-0.0000,), (0.5922,))
+        probe_evaluator = LinearProbeEvaluator(
+            data_path=probe_data_path,
+            image_size=crop_size,
+            norm_stats=norm_stats_probe,
+            k_spt=probe_k_spt,
+            k_qry=probe_k_qry,
+            probe_epochs=probe_epochs,
+            device=device,
+        )
+        if not probe_evaluator.tasks:
+            probe_evaluator = None
 
     # -- init optimizer and scheduler
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
@@ -373,6 +631,45 @@ def main(args, resume_preempt=False):
         # -- Save Checkpoint after every epoch
         logger.info('avg. loss %.3f' % loss_meter.avg)
         save_checkpoint(epoch+1)
+
+        # -- W&B + probe logging (rank 0)
+        if rank == 0:
+            wandb_log = {
+                'train/loss': loss_meter.avg,
+                'train/mask_a': maskA_meter.avg,
+                'train/mask_b': maskB_meter.avg,
+                'train/lr': _new_lr,
+                'train/wd': _new_wd,
+                'train/time_ms': time_meter.avg,
+                'epoch': epoch + 1,
+            }
+
+            # -- Online linear probe
+            if probe_evaluator is not None and (epoch + 1) % probe_freq == 0:
+                t0 = time.time()
+                probe_metrics = probe_evaluator.evaluate(target_encoder, device)
+                probe_time = time.time() - t0
+                logger.info(
+                    f'Probe (ep {epoch+1}): '
+                    f'R²={probe_metrics["probe/r2_mean"]:.4f}±'
+                    f'{probe_metrics["probe/r2_std"]:.4f}  '
+                    f'RMSE={probe_metrics["probe/rmse_mean"]:.4f}±'
+                    f'{probe_metrics["probe/rmse_std"]:.4f}  '
+                    f'({probe_metrics["probe/n_tasks"]} tasks, {probe_time:.1f}s)'
+                )
+                wandb_log.update(probe_metrics)
+                # Restore training mode
+                encoder.train()
+                predictor.train()
+
+            if use_wandb:
+                import wandb
+                wandb.log(wandb_log)
+
+    # -- Finish W&B
+    if use_wandb:
+        import wandb
+        wandb.finish()
 
 
 if __name__ == "__main__":
