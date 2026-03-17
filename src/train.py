@@ -81,7 +81,8 @@ class LinearProbeEvaluator:
     """
 
     def __init__(self, data_path, image_size=224, norm_stats=None,
-                 k_spt=25, k_qry=25, probe_epochs=50, device='cpu'):
+                 k_spt=25, k_qry=25, probe_epochs=50, device='cpu',
+                 global_stats=None):
         import pandas as pd
         from sklearn.preprocessing import StandardScaler
         from pyts.image import GramianAngularField
@@ -91,6 +92,7 @@ class LinearProbeEvaluator:
         self.device = device
         self.image_size = image_size
         self.norm_stats = norm_stats
+        self.global_stats = global_stats  # (global_min, global_max) or None
         self.tasks = []  # list of (name, supp_x, supp_y, query_x, query_y)
 
         splits_file = os.path.join(data_path, 'splits.csv')
@@ -160,6 +162,13 @@ class LinearProbeEvaluator:
         # Convert sampled spectra → GADF 2D images [N, 1, H, W]
         supp_gadf = gaf.transform(X_supp[spt_idx])  # [n_spt, H, W]
         query_gadf = gaf.transform(X_query[qry_idx])  # [n_qry, H, W]
+
+        if self.global_stats is not None:
+            from src.gadf_utils import encode_diagonal
+            encode_diagonal(supp_gadf, X_supp[spt_idx],
+                            *self.global_stats, self.image_size)
+            encode_diagonal(query_gadf, X_query[qry_idx],
+                            *self.global_stats, self.image_size)
 
         sx = torch.from_numpy(supp_gadf.astype(np.float32)).unsqueeze(1)
         qx = torch.from_numpy(query_gadf.astype(np.float32)).unsqueeze(1)
@@ -408,6 +417,22 @@ def main(args, resume_preempt=False):
         min_keep=min_keep,
         symmetric_masking=(dataset_type == 'gadf'))
 
+    # -- Load GADF norm stats from file (or fallback to defaults)
+    gadf_norm_stats_path = args['data'].get('gadf_norm_stats', None)
+    use_diagonal = args['data'].get('gadf_global_stats', None) is not None
+    if dataset_type == 'gadf' and gadf_norm_stats_path is not None:
+        from src.gadf_utils import load_norm_stats
+        norm_stats_tuple = load_norm_stats(gadf_norm_stats_path,
+                                           use_diagonal=use_diagonal)
+        logger.info(f'GADF norm stats from {gadf_norm_stats_path} '
+                    f'(diagonal={use_diagonal}): '
+                    f'mean={norm_stats_tuple[0]}, std={norm_stats_tuple[1]}')
+    elif dataset_type == 'gadf':
+        norm_stats_tuple = ((-0.0000,), (0.5922,))
+        logger.warning('No gadf_norm_stats in config, using hardcoded defaults')
+    else:
+        norm_stats_tuple = None
+
     transform = make_transforms(
         crop_size=crop_size,
         crop_scale=crop_scale,
@@ -416,7 +441,7 @@ def main(args, resume_preempt=False):
         color_distortion=use_color_distortion,
         color_jitter=color_jitter,
         in_chans=in_chans,
-        norm_stats=((-0.0000,), (0.5922,)) if dataset_type == 'gadf' else None)
+        norm_stats=norm_stats_tuple)
 
     # -- init data-loaders/samplers
     if dataset_type == 'gadf':
@@ -449,7 +474,15 @@ def main(args, resume_preempt=False):
     # -- Online linear probe evaluator (rank 0 only)
     probe_evaluator = None
     if probe_freq > 0 and rank == 0 and dataset_type == 'gadf':
-        norm_stats_probe = ((-0.0000,), (0.5922,))
+        norm_stats_probe = norm_stats_tuple  # same norm as pretraining transforms
+        # Diagonal encoding: cargar stats globales si se especificó en config
+        gadf_global_stats_path = args['data'].get('gadf_global_stats', None)
+        probe_global_stats = None
+        if gadf_global_stats_path is not None:
+            from src.gadf_utils import load_global_stats
+            probe_global_stats = load_global_stats(gadf_global_stats_path)
+            logger.info(f'Diagonal encoding for probe: min={probe_global_stats[0]:.4f}, '
+                        f'max={probe_global_stats[1]:.4f}')
         probe_evaluator = LinearProbeEvaluator(
             data_path=probe_data_path,
             image_size=crop_size,
@@ -458,6 +491,7 @@ def main(args, resume_preempt=False):
             k_qry=probe_k_qry,
             probe_epochs=probe_epochs,
             device=device,
+            global_stats=probe_global_stats,
         )
         if not probe_evaluator.tasks:
             probe_evaluator = None

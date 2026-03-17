@@ -1,9 +1,17 @@
 """
 Pre-computa imágenes GADF 224×224 para todos los espectros de X_supp.csv y X_query.csv
 y las guarda en data/gadf_224.h5 con shape (N, 1, 224, 224), dtype float16.
+
+Flags:
+  --encode_diagonal   Codifica la magnitud espectral (normalizada globalmente)
+                      en la diagonal de la GADF (por defecto desactivado).
+  --stats_path        Ruta al JSON con min/max globales PAA (necesario si
+                      --encode_diagonal está activo).
 """
 
+import argparse
 import os
+import sys
 import time
 
 # Asegurar que se use la libstdc++ del conda env (tiene GLIBCXX_3.4.29)
@@ -22,15 +30,35 @@ import numpy as np
 import pandas as pd
 from pyts.image import GramianAngularField
 
+# Añadir raíz del proyecto al path para importar src
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 DATA_DIR = "/mnt/homeGPU/igarzon/Meta-Learning/SpectraMAENet/data/Soil_NIR_AGG"
 CSV_FILES = ["X_supp.csv", "X_query.csv"]
 OUTPUT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "data", "gadf_224.h5")
+                           "data", "gadf_224_diagonal.h5")
 IMAGE_SIZE = 224
 BATCH_SIZE = 256
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Pre-computa imágenes GADF")
+    parser.add_argument("--encode_diagonal", action="store_true",
+                        help="Codifica magnitud espectral en la diagonal")
+    parser.add_argument("--stats_path",
+                        default=os.path.join(os.path.dirname(os.path.dirname(
+                            os.path.abspath(__file__))),
+                            "data", "gadf_paa_global_stats.json"),
+                        help="Ruta al JSON con min/max globales PAA")
+    args = parser.parse_args()
+
+    # Cargar stats globales si se usa diagonal
+    global_min, global_max = None, None
+    if args.encode_diagonal:
+        from src.gadf_utils import encode_diagonal, load_global_stats
+        global_min, global_max = load_global_stats(args.stats_path)
+        print(f"Diagonal encoding ON (min={global_min:.4f}, max={global_max:.4f})")
+
     # Cargar todos los espectros
     dfs = []
     for fname in CSV_FILES:
@@ -63,6 +91,9 @@ def main():
         for start in range(0, N, BATCH_SIZE):
             end = min(start + BATCH_SIZE, N)
             batch = gaf.fit_transform(X[start:end])  # (B, 224, 224)
+            if args.encode_diagonal:
+                encode_diagonal(batch, X[start:end], global_min, global_max,
+                                IMAGE_SIZE)
             dset[start:end, 0, :, :] = batch.astype(np.float16)
 
             if end % 1000 < BATCH_SIZE or end == N:

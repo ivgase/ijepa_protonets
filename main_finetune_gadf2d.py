@@ -178,7 +178,7 @@ class SimpleTask2D:
 
     def __init__(self, data_path, target_column=None,
                  image_size=224, norm_stats=None, scale_y=True,
-                 device='cuda'):
+                 device='cuda', global_stats=None):
         self.name = os.path.basename(data_path.rstrip('/'))
         self.data_path = data_path
         self.device = device
@@ -233,6 +233,13 @@ class SimpleTask2D:
                   f"and query ({query_np.shape[0]}) on-the-fly ...")
             self.support_x = spectra_to_gadf(supp_np, image_size=image_size)
             self.query_x = spectra_to_gadf(query_np, image_size=image_size)
+            if global_stats is not None:
+                from src.gadf_utils import encode_diagonal
+                gmin, gmax = global_stats
+                encode_diagonal(self.support_x[:, 0].numpy(), supp_np,
+                                gmin, gmax, image_size)
+                encode_diagonal(self.query_x[:, 0].numpy(), query_np,
+                                gmin, gmax, image_size)
 
         # -- Normalizar GADF (misma normalización que el pretraining)
         if norm_stats is not None:
@@ -429,8 +436,13 @@ def get_args_parser():
     # GADF
     p.add_argument('--gadf_image_size', default=224, type=int,
                    help='Tamaño de la imagen GADF generada')
-    p.add_argument('--gadf_norm_mean', default=-0.0000, type=float)
-    p.add_argument('--gadf_norm_std', default=0.5922, type=float)
+    p.add_argument('--gadf_norm_stats', default='data/gadf_norm_stats.json',
+                   type=str, help='JSON con mean/std de normalización GADF '
+                   '(generado por compute_gadf_stats.py)')
+    p.add_argument('--encode_diagonal', action='store_true',
+                   help='Codifica magnitud espectral en la diagonal GADF')
+    p.add_argument('--gadf_global_stats', default='data/gadf_paa_global_stats.json',
+                   type=str, help='Ruta al JSON con min/max globales PAA')
 
     # Few-shot
     p.add_argument('--k_spt', type=int, default=25)
@@ -468,9 +480,26 @@ def main(args):
     with open(os.path.join(args.save_path, "config.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
 
-    # -- Normalización GADF (misma que pretraining)
-    norm_stats = (args.gadf_norm_mean, args.gadf_norm_std)
+    # -- Normalización GADF (lee de JSON, selecciona variante según --encode_diagonal)
+    if os.path.exists(args.gadf_norm_stats):
+        from src.gadf_utils import load_norm_stats
+        norm_mean, norm_std = load_norm_stats(args.gadf_norm_stats,
+                                              use_diagonal=args.encode_diagonal)
+        norm_stats = (norm_mean[0], norm_std[0])  # scalars for SimpleTask2D
+        variant = 'with_diagonal' if args.encode_diagonal else 'no_diagonal'
+        print(f"Norm stats from {args.gadf_norm_stats} [{variant}]: "
+              f"mean={norm_stats[0]:.6f}, std={norm_stats[1]:.6f}")
+    else:
+        norm_stats = (-0.0000, 0.5922)
+        print(f"WARNING: {args.gadf_norm_stats} not found, using hardcoded defaults")
     scale_y = not args.no_scale_y
+
+    # -- Diagonal encoding (opcional)
+    global_stats = None
+    if args.encode_diagonal:
+        from src.gadf_utils import load_global_stats
+        global_stats = load_global_stats(args.gadf_global_stats)
+        print(f"Diagonal encoding ON (min={global_stats[0]:.4f}, max={global_stats[1]:.4f})")
 
     # -- Cargar tareas
     if args.region_tasks:
@@ -495,7 +524,7 @@ def main(args):
                     data_path=task_dir, target_column=None,
                     image_size=args.gadf_image_size,
                     norm_stats=norm_stats, scale_y=scale_y,
-                    device=device)
+                    device=device, global_stats=global_stats)
                 t.name = tname
                 tasks.append(t)
             except Exception as e:
@@ -516,7 +545,7 @@ def main(args):
                 data_path=args.data_path, target_column=tc,
                 image_size=args.gadf_image_size,
                 norm_stats=norm_stats, scale_y=scale_y,
-                device=device)
+                device=device, global_stats=global_stats)
             t.name = f"{t.name}_{tc}"
             tasks.append(t)
         print(f"\nLoaded {len(tasks)} task(s) in simple mode")

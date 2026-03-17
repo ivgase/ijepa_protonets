@@ -23,11 +23,13 @@ class GADFDataset(torch.utils.data.Dataset):
         csv_path=None,
         image_size=224,
         precomputed=True,
-        transform=None
+        transform=None,
+        global_stats=None
     ):
         self.precomputed = precomputed
         self.transform = transform
         self.image_size = image_size
+        self.global_stats = global_stats  # (global_min, global_max) or None
 
         if precomputed:
             assert h5_path is not None, "h5_path requerido en modo precomputed"
@@ -58,6 +60,10 @@ class GADFDataset(torch.utils.data.Dataset):
         else:
             spectrum = self.spectra[idx : idx + 1]  # (1, n_wavelengths)
             gadf_img = self.gaf.transform(spectrum)  # (1, image_size, image_size)
+            if self.global_stats is not None:
+                from src.gadf_utils import encode_diagonal
+                encode_diagonal(gadf_img, spectrum,
+                                *self.global_stats, self.image_size)
             img = torch.from_numpy(gadf_img[0].astype(np.float32)).unsqueeze(0)  # (1, H, W)
 
         if self.transform is not None:

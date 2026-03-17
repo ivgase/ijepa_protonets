@@ -15,6 +15,10 @@ Estructura de salida:
 
 Cada X_supp.csv / X_query.csv se computa individualmente (sin deduplicación).
 
+Flags:
+    --encode_diagonal   Codifica magnitud espectral en la diagonal GADF
+    --stats_path        Ruta al JSON con min/max globales PAA
+
 Uso:
     python scripts/precompute_gadf_downstream.py \
         --src ../SpectraI-JEPA/data/Soil_NIR_AGG_mixed \
@@ -25,6 +29,7 @@ Uso:
 import argparse
 import os
 import shutil
+import sys
 import time
 
 # Asegurar que se use la libstdc++ del conda env (tiene GLIBCXX_3.4.29)
@@ -42,13 +47,21 @@ import pandas as pd
 import torch
 from pyts.image import GramianAngularField
 
+# Añadir raíz del proyecto al path para importar src
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 # ============================================================================
 # Helpers
 # ============================================================================
 
-def compute_gadf(csv_path, image_size, batch_size=256):
-    """Lee un CSV de espectros y devuelve un tensor GADF (N, 1, H, W) float16."""
+def compute_gadf(csv_path, image_size, batch_size=256,
+                 global_min=None, global_max=None):
+    """Lee un CSV de espectros y devuelve un tensor GADF (N, 1, H, W) float16.
+
+    Si global_min/global_max se proporcionan, codifica la magnitud espectral
+    normalizada globalmente en la diagonal de la GADF.
+    """
     df = pd.read_csv(csv_path, index_col=0)
     X = df.values.astype(np.float32)
     N = X.shape[0]
@@ -59,6 +72,10 @@ def compute_gadf(csv_path, image_size, batch_size=256):
     for start in range(0, N, batch_size):
         end = min(start + batch_size, N)
         batch = gaf.transform(X[start:end])  # (B, H, W)
+        if global_min is not None and global_max is not None:
+            from src.gadf_utils import encode_diagonal
+            encode_diagonal(batch, X[start:end], global_min, global_max,
+                            image_size)
         chunks.append(batch)
 
     images = np.concatenate(chunks, axis=0)  # (N, H, W)
@@ -79,7 +96,21 @@ def main():
                         help="Directorio de salida para la estructura GADF")
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--encode_diagonal", action="store_true",
+                        help="Codifica magnitud espectral en la diagonal")
+    parser.add_argument("--stats_path",
+                        default=os.path.join(os.path.dirname(os.path.dirname(
+                            os.path.abspath(__file__))),
+                            "data", "gadf_paa_global_stats.json"),
+                        help="Ruta al JSON con min/max globales PAA")
     args = parser.parse_args()
+
+    # Cargar stats globales si se usa diagonal
+    global_min, global_max = None, None
+    if args.encode_diagonal:
+        from src.gadf_utils import load_global_stats
+        global_min, global_max = load_global_stats(args.stats_path)
+        print(f"Diagonal encoding ON (min={global_min:.4f}, max={global_max:.4f})")
 
     src = os.path.abspath(args.src)
     dst = os.path.abspath(args.dst)
@@ -118,7 +149,8 @@ def main():
                 print(f"  WARNING: {x_name}.csv not found, skipping")
                 continue
 
-            tensor = compute_gadf(csv_path, args.image_size, args.batch_size)
+            tensor = compute_gadf(csv_path, args.image_size, args.batch_size,
+                                  global_min, global_max)
             torch.save(tensor, pt_path)
             total_samples += tensor.shape[0]
             total_files += 1
