@@ -107,6 +107,24 @@ class GADF2DForRegression(nn.Module):
 
 
 # ============================================================================
+# HeadOnlyModel — para linear probing con features pre-extraídas
+# ============================================================================
+
+class HeadOnlyModel(nn.Module):
+    """Aplica solo la cabeza de regresión a features pre-extraídas [B, D]."""
+
+    def __init__(self, embed_dim, out_dim=1):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, out_dim),
+        )
+
+    def forward(self, x):
+        return self.head(x)
+
+
+# ============================================================================
 # Checkpoint loader
 # ============================================================================
 
@@ -149,6 +167,19 @@ def load_ijepa2d_encoder(checkpoint_path, model_name='vit_base',
 # ============================================================================
 # Spectra → GADF 2D conversion
 # ============================================================================
+
+@torch.no_grad()
+def extract_features(encoder, images, device, batch_size=32):
+    """Extrae features con global avg pool: [N, 1, H, W] → [N, D] en CPU."""
+    encoder.eval()
+    all_feats = []
+    for i in range(0, len(images), batch_size):
+        batch = images[i:i+batch_size].to(device)
+        feats = encoder(batch, masks=None)   # [B, 196, D]
+        feats = feats.mean(dim=1)            # [B, D]
+        all_feats.append(feats.cpu())
+    return torch.cat(all_feats, dim=0)
+
 
 def spectra_to_gadf(spectra_array, image_size=224):
     """Convierte un array de espectros [N, L] a imágenes GADF [N, 1, H, W].
@@ -568,6 +599,35 @@ def main(args):
         print(f"Task {task_idx + 1}/{len(tasks)}: {task_name}")
         print(f"{'='*60}")
 
+        # -- Linear probing: pre-extraer features UNA vez por tarea
+        if args.linear_probing:
+            if args.model_weight:
+                encoder, embed_dim = load_ijepa2d_encoder(
+                    checkpoint_path=args.model_weight,
+                    model_name=args.model_name,
+                    patch_size=args.patch_size,
+                    crop_size=args.crop_size,
+                    in_chans=1)
+            else:
+                encoder = vit.__dict__[args.model_name](
+                    img_size=[args.crop_size],
+                    patch_size=args.patch_size,
+                    in_chans=1)
+                embed_dim = encoder.embed_dim
+                print('Using random encoder (no pretrained weights)')
+
+            encoder = encoder.to(device)
+            print(f"  Pre-extracting features for linear probing...")
+            task.support_x = extract_features(
+                encoder, task.support_x, device, batch_size=args.batch_size)
+            task.query_x = extract_features(
+                encoder, task.query_x, device, batch_size=args.batch_size)
+            print(f"  Features: support {tuple(task.support_x.shape)}, "
+                  f"query {tuple(task.query_x.shape)}")
+
+            del encoder
+            torch.cuda.empty_cache()
+
         for repeat in range(1, n_repeats + 1):
             print(f"\n--- Repeat {repeat}/{n_repeats} ---")
             torch.manual_seed(42 + repeat)
@@ -588,42 +648,43 @@ def main(args):
                 batch_size=args.batch_size, shuffle=False)
 
             # -- Build model
-            if args.model_weight:
-                encoder, embed_dim = load_ijepa2d_encoder(
-                    checkpoint_path=args.model_weight,
-                    model_name=args.model_name,
-                    patch_size=args.patch_size,
-                    crop_size=args.crop_size,
-                    in_chans=1)
+            if args.linear_probing:
+                # Features ya pre-extraídas → solo cabeza
+                model = HeadOnlyModel(embed_dim, out_dim=1).to(device)
+                trainable = sum(p.numel() for p in model.parameters())
+                print(f'Linear probing (pre-extracted): {trainable} trainable params')
             else:
-                encoder = vit.__dict__[args.model_name](
-                    img_size=[args.crop_size],
-                    patch_size=args.patch_size,
-                    in_chans=1)
-                embed_dim = encoder.embed_dim
-                print('Training from scratch (no pretrained weights)')
+                if args.model_weight:
+                    encoder, embed_dim = load_ijepa2d_encoder(
+                        checkpoint_path=args.model_weight,
+                        model_name=args.model_name,
+                        patch_size=args.patch_size,
+                        crop_size=args.crop_size,
+                        in_chans=1)
+                else:
+                    encoder = vit.__dict__[args.model_name](
+                        img_size=[args.crop_size],
+                        patch_size=args.patch_size,
+                        in_chans=1)
+                    embed_dim = encoder.embed_dim
+                    print('Training from scratch (no pretrained weights)')
 
-            model = GADF2DForRegression(encoder, embed_dim, out_dim=1).to(device)
-            total_params = sum(p.numel() for p in model.parameters())
-            print(f'GADF2DForRegression: {total_params/1e6:.2f}M params')
+                model = GADF2DForRegression(encoder, embed_dim, out_dim=1).to(device)
+                total_params = sum(p.numel() for p in model.parameters())
+                print(f'GADF2DForRegression: {total_params/1e6:.2f}M params')
 
-            if args.use_lora:
-                from src.lora import apply_lora, count_trainable_parameters
-                for param in model.encoder.parameters():
-                    param.requires_grad_(False)
-                n_lora = apply_lora(model.encoder,
-                                    target_modules=args.lora_target_modules,
-                                    r=args.lora_r, alpha=args.lora_alpha,
-                                    dropout=args.lora_dropout)
-                trainable, total, pct = count_trainable_parameters(model)
-                print(f'LoRA applied to {n_lora} modules: '
-                      f'{trainable} trainable / {total} total ({pct:.2f}%)')
-            elif args.linear_probing:
-                for name, param in model.named_parameters():
-                    if 'head' not in name:
+                if args.use_lora:
+                    from src.lora import apply_lora, count_trainable_parameters
+                    for param in model.encoder.parameters():
                         param.requires_grad_(False)
-                trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                print(f'Linear probing: encoder frozen, {trainable} trainable params')
+                    n_lora = apply_lora(model.encoder,
+                                        target_modules=args.lora_target_modules,
+                                        r=args.lora_r, alpha=args.lora_alpha,
+                                        dropout=args.lora_dropout)
+                    model.to(device)  # move new LoRA params to device
+                    trainable, total, pct = count_trainable_parameters(model)
+                    print(f'LoRA applied to {n_lora} modules: '
+                          f'{trainable} trainable / {total} total ({pct:.2f}%)')
 
             # -- Optimizer
             optimizer = torch.optim.AdamW(
