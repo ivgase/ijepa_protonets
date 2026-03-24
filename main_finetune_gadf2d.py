@@ -81,6 +81,52 @@ class EarlyStop:
 
 
 # ============================================================================
+# Pooling modules
+# ============================================================================
+
+class AvgPool(nn.Module):
+    """Global average pooling sobre patch tokens."""
+    def forward(self, x):  # [B, N, D]
+        return x.mean(dim=1)  # [B, D]
+
+
+class AttentionPool(nn.Module):
+    """Attention pooling: score independiente por patch, weighted sum."""
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.attn = nn.Linear(embed_dim, 1)
+
+    def forward(self, x):  # [B, N, D]
+        w = self.attn(x).softmax(dim=1)  # [B, N, 1]
+        return (w * x).sum(dim=1)         # [B, D]
+
+
+class MultiHeadAttentionPool(nn.Module):
+    """MAP: cross-attention con query learnable sobre patch tokens."""
+    def __init__(self, embed_dim, num_heads=8):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+
+    def forward(self, x):  # [B, N, D]
+        q = self.query.expand(x.size(0), -1, -1)  # [B, 1, D]
+        out, _ = self.attn(q, x, x)               # [B, 1, D]
+        return out.squeeze(1)                       # [B, D]
+
+
+def make_pool(mode, embed_dim):
+    """Factory para crear el módulo de pooling."""
+    if mode == 'avg':
+        return AvgPool()
+    elif mode == 'attn':
+        return AttentionPool(embed_dim)
+    elif mode == 'map':
+        return MultiHeadAttentionPool(embed_dim)
+    else:
+        raise ValueError(f"Unknown pool_mode: {mode}")
+
+
+# ============================================================================
 # GADF2DForRegression
 # ============================================================================
 
@@ -88,13 +134,15 @@ class GADF2DForRegression(nn.Module):
     """Cabeza de regresión sobre el ViT encoder pretrained (2D GADF).
 
     Forward:
-        x [B, 1, 224, 224] → encoder → [B, N, D] → global avg pool → [B, D]
+        x [B, 1, 224, 224] → encoder → [B, N, D] → pool → [B, D]
                            → head → [B, out_dim]
     """
 
-    def __init__(self, encoder: nn.Module, embed_dim: int, out_dim: int = 1):
+    def __init__(self, encoder: nn.Module, embed_dim: int, out_dim: int = 1,
+                 pool=None):
         super().__init__()
         self.encoder = encoder
+        self.pool = pool or AvgPool()
         self.head = nn.Sequential(
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, out_dim),
@@ -102,7 +150,7 @@ class GADF2DForRegression(nn.Module):
 
     def forward(self, x):
         z = self.encoder(x, masks=None)   # [B, N, D]
-        z = z.mean(dim=1)                 # [B, D]  global average pooling
+        z = self.pool(z)                  # [B, D]
         return self.head(z)               # [B, out_dim]
 
 
@@ -111,16 +159,19 @@ class GADF2DForRegression(nn.Module):
 # ============================================================================
 
 class HeadOnlyModel(nn.Module):
-    """Aplica solo la cabeza de regresión a features pre-extraídas [B, D]."""
+    """Aplica pooling + cabeza de regresión a features pre-extraídas [B, N, D]."""
 
-    def __init__(self, embed_dim, out_dim=1):
+    def __init__(self, embed_dim, out_dim=1, pool=None):
         super().__init__()
+        self.pool = pool or AvgPool()
         self.head = nn.Sequential(
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, out_dim),
         )
 
     def forward(self, x):
+        if x.dim() == 3:
+            x = self.pool(x)  # [B, N, D] → [B, D]
         return self.head(x)
 
 
@@ -170,13 +221,12 @@ def load_ijepa2d_encoder(checkpoint_path, model_name='vit_base',
 
 @torch.no_grad()
 def extract_features(encoder, images, device, batch_size=32):
-    """Extrae features con global avg pool: [N, 1, H, W] → [N, D] en CPU."""
+    """Extrae patch tokens: [N, 1, H, W] → [N, 196, D] en CPU."""
     encoder.eval()
     all_feats = []
     for i in range(0, len(images), batch_size):
         batch = images[i:i+batch_size].to(device)
         feats = encoder(batch, masks=None)   # [B, 196, D]
-        feats = feats.mean(dim=1)            # [B, D]
         all_feats.append(feats.cpu())
     return torch.cat(all_feats, dim=0)
 
@@ -440,6 +490,8 @@ def get_args_parser():
     p.add_argument('--patience', default=30, type=int)
     p.add_argument('--linear_probing', action='store_true',
                    help='Freeze encoder, train only regression head')
+    p.add_argument('--pool_mode', default='avg', choices=['avg', 'attn', 'map'],
+                   help='Pooling over patch tokens: avg (mean), attn (learned weights), map (cross-attention)')
     p.add_argument('--use_lora', action='store_true',
                    help='Use LoRA fine-tuning (freeze base, train LoRA + head)')
     p.add_argument('--lora_r', type=int, default=8,
@@ -648,11 +700,13 @@ def main(args):
                 batch_size=args.batch_size, shuffle=False)
 
             # -- Build model
+            pool = make_pool(args.pool_mode, embed_dim)
             if args.linear_probing:
-                # Features ya pre-extraídas → solo cabeza
-                model = HeadOnlyModel(embed_dim, out_dim=1).to(device)
+                # Features ya pre-extraídas → pool + cabeza
+                model = HeadOnlyModel(embed_dim, out_dim=1, pool=pool).to(device)
                 trainable = sum(p.numel() for p in model.parameters())
-                print(f'Linear probing (pre-extracted): {trainable} trainable params')
+                print(f'Linear probing (pre-extracted, pool={args.pool_mode}): '
+                      f'{trainable} trainable params')
             else:
                 if args.model_weight:
                     encoder, embed_dim = load_ijepa2d_encoder(
@@ -669,7 +723,7 @@ def main(args):
                     embed_dim = encoder.embed_dim
                     print('Training from scratch (no pretrained weights)')
 
-                model = GADF2DForRegression(encoder, embed_dim, out_dim=1).to(device)
+                model = GADF2DForRegression(encoder, embed_dim, out_dim=1, pool=pool).to(device)
                 total_params = sum(p.numel() for p in model.parameters())
                 print(f'GADF2DForRegression: {total_params/1e6:.2f}M params')
 

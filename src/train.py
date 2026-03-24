@@ -22,6 +22,7 @@ import logging
 import sys
 import time
 import yaml
+from datetime import timedelta
 
 import numpy as np
 
@@ -56,6 +57,7 @@ from src.transforms import make_transforms
 log_timings = True
 log_freq = 10
 checkpoint_freq = 50
+artifact_ttl = timedelta(days=15)
 # --
 
 _GLOBAL_SEED = 0
@@ -537,7 +539,12 @@ def main(args, resume_preempt=False):
             next(momentum_scheduler)
             mask_collator.step()
 
+    best_probe_r2 = -float('inf')
+    best_ckpt_artifact = None
+    last_logged_artifact = None  # most recent periodic artifact version name
+
     def save_checkpoint(epoch):
+        nonlocal last_logged_artifact
         save_dict = {
             'encoder': encoder.state_dict(),
             'predictor': predictor.state_dict(),
@@ -553,7 +560,21 @@ def main(args, resume_preempt=False):
         if rank == 0:
             torch.save(save_dict, latest_path)
             if (epoch + 1) % checkpoint_freq == 0:
-                torch.save(save_dict, save_path.format(epoch=f'{epoch + 1}'))
+                ckpt_path = save_path.format(epoch=f'{epoch + 1}')
+                torch.save(save_dict, ckpt_path)
+                # Log as wandb artifact with TTL
+                if use_wandb:
+                    import wandb
+                    art = wandb.Artifact(
+                        f'{tag}-checkpoint',
+                        type='model',
+                        metadata={'epoch': epoch + 1, 'loss': loss_meter.avg},
+                        ttl=artifact_ttl,
+                    )
+                    art.add_file(ckpt_path)
+                    logged = wandb.log_artifact(art)
+                    logged.wait()
+                    last_logged_artifact = logged.name
 
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
@@ -692,6 +713,13 @@ def main(args, resume_preempt=False):
                     f'({probe_metrics["probe/n_tasks"]} tasks, {probe_time:.1f}s)'
                 )
                 wandb_log.update(probe_metrics)
+                # Track best probe R² for artifact TTL
+                r2 = probe_metrics['probe/r2_mean']
+                if r2 > best_probe_r2 and last_logged_artifact is not None:
+                    best_probe_r2 = r2
+                    best_ckpt_artifact = last_logged_artifact
+                    logger.info(f'New best probe R²={r2:.4f} at epoch {epoch+1}'
+                                f' → artifact {best_ckpt_artifact}')
                 # Restore training mode
                 encoder.train()
                 predictor.train()
@@ -699,6 +727,30 @@ def main(args, resume_preempt=False):
             if use_wandb:
                 import wandb
                 wandb.log(wandb_log)
+
+    # -- Log final checkpoint as artifact (no TTL) and remove TTL from best
+    if use_wandb and rank == 0:
+        import wandb
+        # Log latest checkpoint without TTL
+        art = wandb.Artifact(
+            f'{tag}-checkpoint-latest',
+            type='model',
+            metadata={'epoch': num_epochs, 'loss': loss_meter.avg},
+        )
+        art.add_file(latest_path)
+        wandb.log_artifact(art)
+
+        # Remove TTL from best checkpoint artifact
+        if best_ckpt_artifact is not None:
+            try:
+                api = wandb.Api()
+                full_name = f'{wandb.run.entity}/{wandb.run.project}/{best_ckpt_artifact}'
+                best_art = api.artifact(full_name)
+                best_art.ttl = None
+                best_art.save()
+                logger.info(f'Removed TTL from best artifact: {full_name}')
+            except Exception as e:
+                logger.warning(f'Could not remove TTL from best artifact: {e}')
 
     # -- Finish W&B
     if use_wandb:

@@ -490,6 +490,14 @@ def vit_giant(patch_size=16, **kwargs):
     return model
 
 
+def vit_1d_aligned(patch_size=16, **kwargs):
+    """ViT matching the 1D SpectraI-JEPA architecture: embed_dim=256, depth=8, num_heads=8."""
+    model = VisionTransformer(
+        patch_size=patch_size, embed_dim=256, depth=8, num_heads=8, mlp_ratio=4,
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+
 VIT_EMBED_DIMS = {
     'vit_tiny': 192,
     'vit_small': 384,
@@ -497,4 +505,5 @@ VIT_EMBED_DIMS = {
     'vit_large': 1024,
     'vit_huge': 1280,
     'vit_giant': 1408,
+    'vit_1d_aligned': 256,
 }
