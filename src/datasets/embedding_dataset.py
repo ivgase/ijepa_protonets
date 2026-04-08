@@ -31,20 +31,27 @@ class _QueryDataset(Dataset):
 class EmbeddingTask:
     """A single task with precomputed I-JEPA embeddings.
 
-    Loads emb_supp.pt [N_s, D] and emb_query.pt [N_q, D] plus target CSVs.
+    Loads embeddings plus target CSVs.  Two modes via emb_mode:
+      'mean':    emb_supp.pt    [N_s, D]       — mean-pooled patch tokens
+      'patches': emb_supp_patches.pt [N_s, P, D] — all patch tokens kept
+
     Mirrors the sample() / sample_fixed() / query_dataloader() API of MixedTask.
     """
 
-    def __init__(self, task_dir, name, device='cuda', scale_y=True):
+    def __init__(self, task_dir, name, device='cuda', scale_y=True,
+                 emb_mode='mean'):
         self.name = name
         self.task_dir = task_dir
         self.device = device
 
-        # Load embeddings
+        # Load embeddings (filename depends on mode)
+        suffix = '_patches' if emb_mode == 'patches' else ''
         self.support_x = torch.load(
-            os.path.join(task_dir, 'emb_supp.pt'), map_location='cpu').float()
+            os.path.join(task_dir, f'emb_supp{suffix}.pt'),
+            map_location='cpu').float()
         self.query_x = torch.load(
-            os.path.join(task_dir, 'emb_query.pt'), map_location='cpu').float()
+            os.path.join(task_dir, f'emb_query{suffix}.pt'),
+            map_location='cpu').float()
 
         # Load targets — pick first numeric column
         sy = pd.read_csv(os.path.join(task_dir, 'y_supp.csv'), index_col=0)
@@ -137,7 +144,7 @@ class EmbeddingDataset:
     """
 
     def __init__(self, path, split='train', device='cuda',
-                 scale_y=True, max_tasks=None):
+                 scale_y=True, max_tasks=None, emb_mode='mean'):
         self.path = path
         self.split = split
         self.device = device
@@ -151,28 +158,41 @@ class EmbeddingDataset:
             task_names = list(np.random.choice(
                 task_names, max_tasks, replace=False))
 
-        # Create tasks
-        self.tasks = {}
+        # Determine embedding filenames
+        suffix = '_patches' if emb_mode == 'patches' else ''
+
+        # Store task dirs (lazy loading — tasks are created on demand)
+        self._task_dirs = {}
         self.task_names = []
         for name in sorted(task_names):
             task_dir = os.path.join(path, name)
-            emb_supp = os.path.join(task_dir, 'emb_supp.pt')
-            emb_query = os.path.join(task_dir, 'emb_query.pt')
+            emb_supp = os.path.join(task_dir, f'emb_supp{suffix}.pt')
+            emb_query = os.path.join(task_dir, f'emb_query{suffix}.pt')
             if not os.path.exists(emb_supp) or not os.path.exists(emb_query):
                 continue
-            self.tasks[name] = EmbeddingTask(
-                task_dir, name, device=device, scale_y=scale_y)
+            self._task_dirs[name] = task_dir
             self.task_names.append(name)
 
-        print(f'EmbeddingDataset [{split}]: {len(self.tasks)} tasks loaded')
+        self._device = device
+        self._scale_y = scale_y
+        self._emb_mode = emb_mode
+
+        print(f'EmbeddingDataset [{split}]: {len(self.task_names)} tasks loaded')
+
+    def _load_task(self, name):
+        return EmbeddingTask(
+            self._task_dirs[name], name,
+            device=self._device,
+            scale_y=self._scale_y,
+            emb_mode=self._emb_mode,
+        )
 
     def __len__(self):
-        return len(self.tasks)
+        return len(self.task_names)
 
     def __getitem__(self, idx):
-        name = self.task_names[idx]
-        return self.tasks[name]
+        return self._load_task(self.task_names[idx])
 
     def __iter__(self):
         for name in self.task_names:
-            yield self.tasks[name]
+            yield self._load_task(name)

@@ -33,10 +33,9 @@ from pyts.image import GramianAngularField
 # Añadir raíz del proyecto al path para importar src
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-DATA_DIR = "/mnt/homeGPU/igarzon/Meta-Learning/SpectraMAENet/data/Soil_NIR_AGG"
+DATA_DIR = "/mnt/homeGPU/igarzon/Meta-Learning/SpectraI-JEPA/data/SoilDataset_NIR_agg"
 CSV_FILES = ["X_supp.csv", "X_query.csv"]
-OUTPUT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "data", "gadf_224_diagonal.h5")
+_PROJECT_DATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 IMAGE_SIZE = 224
 BATCH_SIZE = 256
 
@@ -46,11 +45,15 @@ def main():
     parser.add_argument("--encode_diagonal", action="store_true",
                         help="Codifica magnitud espectral en la diagonal")
     parser.add_argument("--stats_path",
-                        default=os.path.join(os.path.dirname(os.path.dirname(
-                            os.path.abspath(__file__))),
-                            "data", "gadf_paa_global_stats.json"),
+                        default=os.path.join(_PROJECT_DATA, "gadf_paa_global_stats_v2.json"),
                         help="Ruta al JSON con min/max globales PAA")
+    parser.add_argument("--output",
+                        default=None,
+                        help="Ruta de salida del HDF5 (por defecto: data/gadf_224_v2[_diagonal].h5)")
     args = parser.parse_args()
+
+    suffix = "_diagonal" if args.encode_diagonal else ""
+    output_path = args.output or os.path.join(_PROJECT_DATA, f"gadf_224_v2{suffix}.h5")
 
     # Cargar stats globales si se usa diagonal
     global_min, global_max = None, None
@@ -64,7 +67,7 @@ def main():
     for fname in CSV_FILES:
         path = os.path.join(DATA_DIR, fname)
         print(f"Cargando {path} ...")
-        df = pd.read_csv(path, index_col=0)
+        df = pd.read_csv(path)
         print(f"  {df.shape[0]} muestras x {df.shape[1]} wavelengths")
         dfs.append(df)
 
@@ -73,14 +76,14 @@ def main():
     print(f"\nTotal: {N} muestras x {X.shape[1]} wavelengths")
 
     # Crear directorio de salida
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     gaf = GramianAngularField(image_size=IMAGE_SIZE, method="difference")
 
-    print(f"\nGenerando GADF {IMAGE_SIZE}x{IMAGE_SIZE} -> {OUTPUT_PATH}")
+    print(f"\nGenerando GADF {IMAGE_SIZE}x{IMAGE_SIZE} -> {output_path}")
     t0 = time.time()
 
-    with h5py.File(OUTPUT_PATH, "w") as f:
+    with h5py.File(output_path, "w") as f:
         dset = f.create_dataset(
             "images",
             shape=(N, 1, IMAGE_SIZE, IMAGE_SIZE),
@@ -102,7 +105,7 @@ def main():
 
     total = time.time() - t0
     print(f"\nCompletado en {total:.1f}s")
-    print(f"Archivo: {OUTPUT_PATH}")
+    print(f"Archivo: {output_path}")
     print(f"Shape: ({N}, 1, {IMAGE_SIZE}, {IMAGE_SIZE}), dtype: float16")
 
 

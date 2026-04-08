@@ -20,10 +20,10 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.gadf_utils import paa_resample
 
-DATA_DIR = "/mnt/homeGPU/igarzon/Meta-Learning/SpectraMAENet/data/Soil_NIR_AGG"
+DATA_DIR = "/mnt/homeGPU/igarzon/Meta-Learning/SpectraI-JEPA/data/SoilDataset_NIR_agg"
 CSV_FILES = ["X_supp.csv", "X_query.csv"]
 OUTPUT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "data", "gadf_paa_global_stats.json")
+                           "data", "gadf_paa_global_stats_v2.json")
 IMAGE_SIZE = 224
 
 
@@ -32,7 +32,7 @@ def main():
     for fname in CSV_FILES:
         path = os.path.join(DATA_DIR, fname)
         print(f"Cargando {path} ...")
-        df = pd.read_csv(path, index_col=0)
+        df = pd.read_csv(path)
         print(f"  {df.shape[0]} muestras x {df.shape[1]} wavelengths")
         dfs.append(df)
 

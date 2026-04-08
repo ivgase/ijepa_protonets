@@ -28,7 +28,7 @@ import torch
 from sklearn.metrics import r2_score
 
 from src.datasets.embedding_dataset import EmbeddingDataset
-from src.protonet import EmbeddingProtoNet, IdentityNet, ProjectionNet
+from src.protonet import EmbeddingProtoNet, EmbResNet1D, IdentityNet, ProjectionNet
 
 try:
     import wandb
@@ -128,7 +128,13 @@ def main(args):
         print(f'{"="*60}')
 
         # Create model
-        if args.no_projection:
+        if args.arch == 'resnet1d':
+            in_channels = 196 if args.emb_mode == 'patches' else 1
+            projection = EmbResNet1D(
+                in_channels=in_channels,
+                output_dim=args.resnet_dim,
+            )
+        elif args.no_projection:
             projection = IdentityNet()
         else:
             projection = ProjectionNet(
@@ -144,15 +150,18 @@ def main(args):
         )
 
         n_params = sum(p.numel() for p in projection.parameters())
-        print(f'ProjectionNet: {n_params:,} params')
+        print(f'{type(projection).__name__}: {n_params:,} params')
 
         # Load data
         train_data = EmbeddingDataset(
-            args.data_path, split='train', device=device, scale_y=True)
+            args.data_path, split='train', device=device, scale_y=True,
+            emb_mode=args.emb_mode)
         val_data = EmbeddingDataset(
-            args.data_path, split='val', device=device, scale_y=True)
+            args.data_path, split='val', device=device, scale_y=True,
+            emb_mode=args.emb_mode)
         test_data = EmbeddingDataset(
-            args.data_path, split='test', device=device, scale_y=True)
+            args.data_path, split='test', device=device, scale_y=True,
+            emb_mode=args.emb_mode)
 
         # Training loop
         history = {'train': {'mse': {}, 'r2': {}},
@@ -343,6 +352,16 @@ if __name__ == '__main__':
                         help='Distance temperature for softmax')
     parser.add_argument('--no_projection', action='store_true',
                         help='Skip projection (use raw embeddings)')
+    parser.add_argument('--arch', type=str, default='mlp',
+                        choices=['mlp', 'resnet1d'],
+                        help='Projection architecture: mlp (default) or resnet1d '
+                             '(convolutional, ported from fewshot_nir_orig)')
+    parser.add_argument('--emb_mode', type=str, default='mean',
+                        choices=['mean', 'patches'],
+                        help='mean: load emb_supp.pt [N,D]; '
+                             'patches: load emb_supp_patches.pt [N,P,D]')
+    parser.add_argument('--resnet_dim', type=int, default=512,
+                        help='EmbResNet1D output dimension (default 512)')
 
     # W&B
     parser.add_argument('--wandb_project', type=str, default='protonet-gadf2d')

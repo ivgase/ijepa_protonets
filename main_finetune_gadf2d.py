@@ -700,9 +700,9 @@ def main(args):
                 batch_size=args.batch_size, shuffle=False)
 
             # -- Build model
-            pool = make_pool(args.pool_mode, embed_dim)
             if args.linear_probing:
                 # Features ya pre-extraídas → pool + cabeza
+                pool = make_pool(args.pool_mode, embed_dim)
                 model = HeadOnlyModel(embed_dim, out_dim=1, pool=pool).to(device)
                 trainable = sum(p.numel() for p in model.parameters())
                 print(f'Linear probing (pre-extracted, pool={args.pool_mode}): '
@@ -723,6 +723,7 @@ def main(args):
                     embed_dim = encoder.embed_dim
                     print('Training from scratch (no pretrained weights)')
 
+                pool = make_pool(args.pool_mode, embed_dim)
                 model = GADF2DForRegression(encoder, embed_dim, out_dim=1, pool=pool).to(device)
                 total_params = sum(p.numel() for p in model.parameters())
                 print(f'GADF2DForRegression: {total_params/1e6:.2f}M params')
