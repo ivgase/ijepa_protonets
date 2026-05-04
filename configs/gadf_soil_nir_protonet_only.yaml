@@ -1,0 +1,55 @@
+data:
+  batch_size: 128           # unused (no I-JEPA loader), kept for parser compat
+  crop_size: 224
+  dataset_type: gadf
+  gadf_global_stats: null
+  gadf_h5_path: data/gadf_224_v2.h5   # unused, kept for parser compat
+  gadf_norm_stats: data/gadf_norm_stats_v2.json
+  num_workers: 4
+  pin_mem: true
+  root_path: /mnt/homeGPU/igarzon/Meta-Learning/SpectraI-JEPA/data/SoilDataset_NIR_agg
+logging:
+  folder: ./logs/gadf_soil_nir_protonet_only/
+  write_tag: gadf_proto_only
+mask:
+  patch_size: 16
+meta:
+  load_checkpoint: true
+  model_name: vit_base
+  use_bfloat16: true
+  read_checkpoint: /mnt/homeGPU/igarzon/Meta-Learning/ijepa_spectra2d/logs/gadf_soil_nir_joint/gadf_joint_20260414_094939/gadf_joint-latest.pth.tar
+optimization:
+  epochs: 20
+  lr: 1.0e-04
+  start_lr: 1.0e-05
+  final_lr: 1.0e-06
+  warmup: 2
+  weight_decay: 0.04
+  final_weight_decay: 0.4
+  ipe_scale: 1.0
+probe:
+  data_path: data/SoilDataset_NIR_gadf2d
+  freq: 5
+  k_qry: 25
+  k_spt: 25
+protonet:
+  data_path: data/SoilDataset_NIR_gadf2d
+  dist_temperature: 0.5
+  enable: true
+  k_qry: 25
+  k_spt: 25
+  loss_type: smooth_l1
+  meta_batch_size: 8
+  projection_hidden_dim: 256
+  projection_output_dim: 128
+  use_projection: false
+eval:
+  enable: true
+  split: test
+  n_repeats: 1
+  batch_size: 64
+  # save_subdir: null → results go to <folder>/eval_<split>/
+wandb:
+  enable: true
+  name: proto_only_from_joint20260414
+  project: ijepa-gadf2d-joint

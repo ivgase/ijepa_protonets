@@ -1,0 +1,54 @@
+data:
+  batch_size: 128           # unused (no I-JEPA loader), kept for parser compat
+  crop_size: 224
+  dataset_type: gadf
+  gadf_global_stats: null
+  gadf_h5_path: data/gadf_224_v2.h5   # unused, kept for parser compat
+  gadf_norm_stats: data/gadf_norm_stats_v2.json
+  num_workers: 4
+  pin_mem: true
+  root_path: /mnt/homeGPU/igarzon/Meta-Learning/SpectraI-JEPA/data/SoilDataset_NIR_agg
+logging:
+  folder: ./logs/gadf_soil_nir_protonet_scratch/
+  write_tag: gadf_proto_scratch
+mask:
+  patch_size: 16
+meta:
+  load_checkpoint: false    # random init ViT — no I-JEPA pre-training
+  read_checkpoint: null
+  model_name: vit_base
+  use_bfloat16: true
+optimization:
+  epochs: 1000              # ~15k pasos con meta_batch=8 (equiv. a 10k eps fewshot_nir_orig con meta_batch=1)
+  lr: 1.0e-03
+  start_lr: 1.0e-05
+  final_lr: 1.0e-05
+  warmup: 20
+  weight_decay: 0.04
+  final_weight_decay: 0.4
+  ipe_scale: 1.0
+probe:
+  data_path: data/SoilDataset_NIR_gadf2d
+  freq: 25
+  k_qry: 25
+  k_spt: 25
+protonet:
+  data_path: data/SoilDataset_NIR_gadf2d
+  dist_temperature: 0.5
+  enable: true
+  k_qry: 25
+  k_spt: 25
+  loss_type: mse            # MSE para igualar fewshot_nir_orig (models/protonet.py:119)
+  meta_batch_size: 8
+  projection_hidden_dim: 256
+  projection_output_dim: 128
+  use_projection: false
+eval:
+  enable: true
+  split: test
+  n_repeats: 1
+  batch_size: 64
+wandb:
+  enable: true
+  name: proto_scratch_vit_base
+  project: ijepa-gadf2d-joint

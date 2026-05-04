@@ -1,0 +1,66 @@
+data:
+  batch_size: 128
+  color_jitter_strength: 0.0
+  crop_scale:
+  - 0.3
+  - 1.0
+  crop_size: 224
+  dataset_type: gadf
+  gadf_h5_path: data/gadf_224_v2_savgol.h5
+  gadf_global_stats: null
+  gadf_norm_stats: data/gadf_norm_stats_v2_savgol.json
+  image_folder: ""
+  num_workers: 10
+  pin_mem: true
+  root_path: /mnt/homeGPU/igarzon/Meta-Learning/SpectraI-JEPA/data/SoilDataset_NIR_agg
+  use_color_distortion: false
+  use_gaussian_blur: false
+  use_horizontal_flip: false
+logging:
+  folder: ./logs/gadf_soil_nir_savgol/
+  write_tag: gadf_jepa_savgol
+mask:
+  allow_overlap: false
+  aspect_ratio:
+  - 0.75
+  - 1.5
+  enc_mask_scale:
+  - 0.85
+  - 1.0
+  min_keep: 10
+  num_enc_masks: 1
+  num_pred_masks: 4
+  patch_size: 16
+  pred_mask_scale:
+  - 0.15
+  - 0.2
+meta:
+  copy_data: false
+  load_checkpoint: false
+  model_name: vit_base
+  pred_depth: 6
+  pred_emb_dim: 384
+  read_checkpoint: null
+  use_bfloat16: true
+optimization:
+  ema:
+  - 0.996
+  - 1.0
+  epochs: 700
+  final_lr: 1.0e-06
+  final_weight_decay: 0.4
+  ipe_scale: 1.0
+  lr: 0.001
+  start_lr: 0.0002
+  warmup: 40
+  weight_decay: 0.04
+wandb:
+  enable: true
+  project: ijepa-gadf2d
+  name: null
+probe:
+  freq: 25
+  data_path: ../SpectraI-JEPA/data/SoilDataset_NIR
+  k_spt: 25
+  k_qry: 25
+  epochs: 50
