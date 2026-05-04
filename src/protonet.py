@@ -121,6 +121,66 @@ class ProjectionNet(nn.Module):
         return self.net(x)
 
 
+class TransformerAggregator(nn.Module):
+    """Small transformer that aggregates ViT patch tokens into a single embedding.
+
+    Flow:
+        [B, N, input_dim]
+          → Linear(input_dim, d_model)          # compress before attention
+          → prepend CLS token + learnable pos_embed
+          → L × Block(d_model, num_heads, ...)   # self-attention over patches
+          → extract CLS (position 0)
+          → LayerNorm → Linear(d_model, output_dim)
+          → [B, output_dim]
+
+    The CLS token learns a selective readout over the patch sequence, which is
+    more expressive than mean-pooling — especially useful for few-shot regression
+    where certain spatial regions (patches) may be more task-relevant than others.
+    """
+
+    def __init__(self, input_dim=768, d_model=256, output_dim=128,
+                 num_patches=196, num_layers=1, num_heads=4,
+                 mlp_ratio=2.0, dropout=0.0, attn_dropout=0.0):
+        # num_patches kept for API compatibility but no longer used (pos_embed removed)
+        super().__init__()
+        from src.models.vision_transformer import Block
+        from src.utils.tensors import trunc_normal_
+
+        self.input_proj = nn.Linear(input_dim, d_model)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+
+        self.blocks = nn.ModuleList([
+            Block(dim=d_model, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                  qkv_bias=True, drop=dropout, attn_drop=attn_dropout)
+            for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(d_model)
+        self.output_proj = nn.Linear(d_model, output_dim)
+
+        # Initialize weights
+        trunc_normal_(self.cls_token, std=0.02)
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        nn.init.zeros_(self.input_proj.bias)
+        nn.init.xavier_uniform_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, N, input_dim]  patch tokens from ViT encoder
+        Returns:
+            [B, output_dim]
+        """
+        B = x.shape[0]
+        x = self.input_proj(x)                                    # [B, N, d_model]
+        cls = self.cls_token.expand(B, -1, -1)                    # [B, 1, d_model]
+        x = torch.cat([cls, x], dim=1)                            # [B, N+1, d_model]
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm(x[:, 0])                                    # CLS token → [B, d_model]
+        return self.output_proj(x)                                 # [B, output_dim]
+
+
 class IdentityNet(nn.Module):
     """No-op projection for ablation (raw embeddings)."""
 
