@@ -6,6 +6,7 @@
 #
 
 import os
+import shutil
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
 try:
@@ -56,7 +57,7 @@ from src.transforms import make_transforms
 # --
 log_timings = True
 log_freq = 10
-checkpoint_freq = 50
+checkpoint_freq = 25
 artifact_ttl = timedelta(days=15)
 # --
 
@@ -319,15 +320,17 @@ def main(args, resume_preempt=False):
     base_folder = args['logging']['folder']
     tag = args['logging']['write_tag']
 
-    # Auto-create timestamped subfolder: logs/gadf_soil_nir/gadf_jepa_20260311_143022/
-    # When resuming, reuse the folder from read_checkpoint if it's a full path
+    # Auto-create subfolder: logs/gadf_soil_nir/gadf_jepa_<run_id>/
+    # run_id can be fixed via args (e.g. SLURM_JOB_ID) for deterministic paths;
+    # falls back to a timestamp when not provided.
+    # When resuming, reuse the folder from read_checkpoint if it's a full path.
     from datetime import datetime
     if load_model and r_file is not None and os.path.isabs(r_file):
         # Absolute checkpoint path → save new outputs next to it
         folder = os.path.dirname(r_file)
     else:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        folder = os.path.join(base_folder, f'{tag}_{timestamp}')
+        run_id = args['logging'].get('run_id') or datetime.now().strftime('%Y%m%d_%H%M%S')
+        folder = os.path.join(base_folder, f'{tag}_{run_id}')
     os.makedirs(folder, exist_ok=True)
 
     # -- WANDB
@@ -367,6 +370,7 @@ def main(args, resume_preempt=False):
             if wandb_name is None:
                 wandb_name = f'{tag}_{model_name}_ps{patch_size}_bs{batch_size}'
             wandb.init(project=wandb_project, name=wandb_name, config=args)
+            wandb.config.update({'checkpoint_dir': os.path.abspath(folder)})
         except Exception as e:
             logger.warning(f'W&B init failed ({e}). Disabling wandb.')
             use_wandb = False
@@ -512,9 +516,10 @@ def main(args, resume_preempt=False):
         num_epochs=num_epochs,
         ipe_scale=ipe_scale,
         use_bfloat16=use_bfloat16)
-    encoder = DistributedDataParallel(encoder, static_graph=True)
-    predictor = DistributedDataParallel(predictor, static_graph=True)
-    target_encoder = DistributedDataParallel(target_encoder)
+    if world_size > 1:
+        encoder = DistributedDataParallel(encoder, static_graph=True)
+        predictor = DistributedDataParallel(predictor, static_graph=True)
+        target_encoder = DistributedDataParallel(target_encoder)
     for p in target_encoder.parameters():
         p.requires_grad = False
 
@@ -542,6 +547,7 @@ def main(args, resume_preempt=False):
     best_probe_r2 = -float('inf')
     best_ckpt_artifact = None
     last_logged_artifact = None  # most recent periodic artifact version name
+    best_probe_path = os.path.join(folder, f'{tag}-best_probe.pth.tar')
 
     def save_checkpoint(epoch):
         nonlocal last_logged_artifact
@@ -569,9 +575,13 @@ def main(args, resume_preempt=False):
                         f'{tag}-checkpoint',
                         type='model',
                         metadata={'epoch': epoch + 1, 'loss': loss_meter.avg},
-                        ttl=artifact_ttl,
                     )
-                    art.add_file(ckpt_path)
+                    # Compatible with wandb versions that do not accept ttl in __init__.
+                    try:
+                        art.ttl = artifact_ttl
+                    except Exception as e:
+                        logger.warning(f'Could not set artifact TTL: {e}')
+                    art.add_reference(f'file://{os.path.abspath(ckpt_path)}')
                     logged = wandb.log_artifact(art)
                     logged.wait()
                     last_logged_artifact = logged.name
@@ -713,13 +723,17 @@ def main(args, resume_preempt=False):
                     f'({probe_metrics["probe/n_tasks"]} tasks, {probe_time:.1f}s)'
                 )
                 wandb_log.update(probe_metrics)
-                # Track best probe R² for artifact TTL
+                # Track best probe R² — save to disk and optionally to wandb artifact
                 r2 = probe_metrics['probe/r2_mean']
-                if r2 > best_probe_r2 and last_logged_artifact is not None:
+                if r2 > best_probe_r2:
                     best_probe_r2 = r2
-                    best_ckpt_artifact = last_logged_artifact
-                    logger.info(f'New best probe R²={r2:.4f} at epoch {epoch+1}'
-                                f' → artifact {best_ckpt_artifact}')
+                    if rank == 0:
+                        shutil.copy2(latest_path, best_probe_path)
+                    log_msg = f'New best probe R²={r2:.4f} at epoch {epoch+1} → {best_probe_path}'
+                    if last_logged_artifact is not None:
+                        best_ckpt_artifact = last_logged_artifact
+                        log_msg += f' (artifact {best_ckpt_artifact})'
+                    logger.info(log_msg)
                 # Restore training mode
                 encoder.train()
                 predictor.train()
@@ -737,7 +751,7 @@ def main(args, resume_preempt=False):
             type='model',
             metadata={'epoch': num_epochs, 'loss': loss_meter.avg},
         )
-        art.add_file(latest_path)
+        art.add_reference(f'file://{os.path.abspath(latest_path)}')
         wandb.log_artifact(art)
 
         # Remove TTL from best checkpoint artifact

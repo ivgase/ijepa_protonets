@@ -8,6 +8,7 @@
 import argparse
 
 import multiprocessing as mp
+import sys
 
 import pprint
 import yaml
@@ -29,6 +30,8 @@ parser.add_argument('--tag', type=str, default=None,
                     help='Override logging.write_tag (experiment name)')
 parser.add_argument('--folder', type=str, default=None,
                     help='Override logging.folder (output directory)')
+parser.add_argument('--run_id', type=str, default=None,
+                    help='Fixed run identifier replacing the auto-generated timestamp in the checkpoint dir')
 parser.add_argument('--lr', type=float, default=None,
                     help='Override optimization.lr')
 parser.add_argument('--epochs', type=int, default=None,
@@ -57,6 +60,8 @@ def apply_overrides(params, args):
         params['logging']['write_tag'] = args.tag
     if args.folder is not None:
         params['logging']['folder'] = args.folder
+    if args.run_id is not None:
+        params['logging']['run_id'] = args.run_id
     if args.lr is not None:
         params['optimization']['lr'] = args.lr
     if args.epochs is not None:
@@ -118,8 +123,21 @@ if __name__ == '__main__':
     num_gpus = len(args.devices)
     mp.set_start_method('spawn')
 
+    processes = []
     for rank in range(num_gpus):
-        mp.Process(
+        p = mp.Process(
             target=process_main,
             args=(rank, args.fname, num_gpus, args.devices, args)
-        ).start()
+        )
+        p.start()
+        processes.append(p)
+
+    exit_code = 0
+    for p in processes:
+        p.join()
+        if p.exitcode not in (0, None):
+            if exit_code == 0:
+                exit_code = p.exitcode if p.exitcode > 0 else 1
+
+    if exit_code != 0:
+        sys.exit(exit_code)
