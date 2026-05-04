@@ -1,3 +1,28 @@
 *.swp
 *.swo
 __pycache__
+
+# Local editor / assistant state
+.vscode/
+.codex/
+
+# Experiment data and generated artifacts
+data/
+logs/
+results/
+artifacts/
+wandb/
+
+# Large generated files
+*.h5
+*.pt
+*.pth
+*.pth.tar
+*.ckpt
+*.out
+*.err
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
