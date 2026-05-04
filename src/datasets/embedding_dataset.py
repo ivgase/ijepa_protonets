@@ -38,24 +38,25 @@ class EmbeddingTask:
     Mirrors the sample() / sample_fixed() / query_dataloader() API of MixedTask.
     """
 
-    def __init__(self, task_dir, name, device='cuda', scale_y=True,
-                 emb_mode='mean'):
+    def __init__(self, data_task_dir, name, embedding_task_dir=None,
+                 device='cuda', scale_y=True, emb_mode='mean'):
         self.name = name
-        self.task_dir = task_dir
+        self.data_task_dir = data_task_dir
+        self.embedding_task_dir = embedding_task_dir or data_task_dir
         self.device = device
 
         # Load embeddings (filename depends on mode)
         suffix = '_patches' if emb_mode == 'patches' else ''
         self.support_x = torch.load(
-            os.path.join(task_dir, f'emb_supp{suffix}.pt'),
+            os.path.join(self.embedding_task_dir, f'emb_supp{suffix}.pt'),
             map_location='cpu').float()
         self.query_x = torch.load(
-            os.path.join(task_dir, f'emb_query{suffix}.pt'),
+            os.path.join(self.embedding_task_dir, f'emb_query{suffix}.pt'),
             map_location='cpu').float()
 
         # Load targets — pick first numeric column
-        sy = pd.read_csv(os.path.join(task_dir, 'y_supp.csv'), index_col=0)
-        qy = pd.read_csv(os.path.join(task_dir, 'y_query.csv'), index_col=0)
+        sy = pd.read_csv(os.path.join(self.data_task_dir, 'y_supp.csv'), index_col=0)
+        qy = pd.read_csv(os.path.join(self.data_task_dir, 'y_query.csv'), index_col=0)
         num_cols = sy.select_dtypes(include='number').columns
         col = num_cols[0]
         sy = sy[col]
@@ -104,9 +105,9 @@ class EmbeddingTask:
     def sample_fixed(self, shots, queries):
         """Deterministic sample for val/test (persists to CSV)."""
         supp_csv = os.path.join(
-            self.task_dir, f'fixed_val_support_{shots}shots.csv')
+            self.data_task_dir, f'fixed_val_support_{shots}shots.csv')
         query_csv = os.path.join(
-            self.task_dir, f'fixed_val_query_{shots}shots.csv')
+            self.data_task_dir, f'fixed_val_query_{shots}shots.csv')
 
         if os.path.exists(supp_csv) and os.path.exists(query_csv):
             si = pd.read_csv(supp_csv, index_col=0)['support_idx'].values
@@ -144,10 +145,12 @@ class EmbeddingDataset:
     """
 
     def __init__(self, path, split='train', device='cuda',
-                 scale_y=True, max_tasks=None, emb_mode='mean'):
+                 scale_y=True, max_tasks=None, emb_mode='mean',
+                 embeddings_root=None):
         self.path = path
         self.split = split
         self.device = device
+        self.embeddings_root = embeddings_root
 
         # Read splits
         splits_df = pd.read_csv(os.path.join(path, 'splits.csv'), index_col=0)
@@ -163,14 +166,20 @@ class EmbeddingDataset:
 
         # Store task dirs (lazy loading — tasks are created on demand)
         self._task_dirs = {}
+        self._embedding_task_dirs = {}
         self.task_names = []
         for name in sorted(task_names):
             task_dir = os.path.join(path, name)
-            emb_supp = os.path.join(task_dir, f'emb_supp{suffix}.pt')
-            emb_query = os.path.join(task_dir, f'emb_query{suffix}.pt')
+            embedding_task_dir = task_dir
+            if embeddings_root is not None:
+                embedding_task_dir = os.path.join(embeddings_root, name)
+
+            emb_supp = os.path.join(embedding_task_dir, f'emb_supp{suffix}.pt')
+            emb_query = os.path.join(embedding_task_dir, f'emb_query{suffix}.pt')
             if not os.path.exists(emb_supp) or not os.path.exists(emb_query):
                 continue
             self._task_dirs[name] = task_dir
+            self._embedding_task_dirs[name] = embedding_task_dir
             self.task_names.append(name)
 
         self._device = device
@@ -182,6 +191,7 @@ class EmbeddingDataset:
     def _load_task(self, name):
         return EmbeddingTask(
             self._task_dirs[name], name,
+            embedding_task_dir=self._embedding_task_dirs[name],
             device=self._device,
             scale_y=self._scale_y,
             emb_mode=self._emb_mode,

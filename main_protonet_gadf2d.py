@@ -14,6 +14,12 @@
 #   python main_protonet_gadf2d.py \
 #       --data_path data/Soil_NIR_AGG_mixed_gadf2d \
 #       --episodes 5000 --repeats 3
+#
+#   # Or read embeddings from an external mirrored root:
+#   python main_protonet_gadf2d.py \
+#       --data_path data/SoilDataset_NIR_gadf2d \
+#       --embeddings_root artifacts/embeddings/model_ep700_mean \
+#       --no_projection --episodes 1
 
 import argparse
 import json
@@ -155,18 +161,19 @@ def main(args):
         # Load data
         train_data = EmbeddingDataset(
             args.data_path, split='train', device=device, scale_y=True,
-            emb_mode=args.emb_mode)
+            emb_mode=args.emb_mode, embeddings_root=args.embeddings_root)
         val_data = EmbeddingDataset(
             args.data_path, split='val', device=device, scale_y=True,
-            emb_mode=args.emb_mode)
+            emb_mode=args.emb_mode, embeddings_root=args.embeddings_root)
         test_data = EmbeddingDataset(
             args.data_path, split='test', device=device, scale_y=True,
-            emb_mode=args.emb_mode)
+            emb_mode=args.emb_mode, embeddings_root=args.embeddings_root)
 
         # Training loop
         history = {'train': {'mse': {}, 'r2': {}},
                    'val': {'mse': {}, 'r2': {}}}
         best_val_r2 = -float('inf')
+        best_val_mse = float('inf')
         best_model_path = os.path.join(args.output, f'best_model_{rep}.pth')
 
         # Track last val metrics for logging between val evaluations
@@ -217,6 +224,7 @@ def main(args):
 
                 if last_val_r2 > best_val_r2:
                     best_val_r2 = last_val_r2
+                    best_val_mse = last_val_mse
                     protonet.save(best_model_path)
                     print(f'  -> New best val R2: {best_val_r2:.4f}')
 
@@ -266,7 +274,7 @@ def main(args):
             index=False)
 
         all_results.append({
-            'mse_val': best_val_r2,
+            'mse_val': best_val_mse,
             'mse_test': test_metrics['mse'],
             'mae_test': test_metrics['mae'],
             'rmse_test': test_metrics['rmse'],
@@ -276,9 +284,14 @@ def main(args):
 
         # Save history
         with open(os.path.join(args.output, f'history_{rep}.json'), 'w') as f:
-            json.dump({k: {str(kk): float(vv) for kk, vv in v.items()}
-                       for k, outer in history.items()
-                       for k, v in outer.items()}, f)
+            json.dump({
+                split: {
+                    metric: {str(episode): float(value)
+                             for episode, value in values.items()}
+                    for metric, values in metrics.items()
+                }
+                for split, metrics in history.items()
+            }, f)
 
         # Plot history
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -332,6 +345,9 @@ if __name__ == '__main__':
                         default='data/Soil_NIR_AGG_mixed_gadf2d')
     parser.add_argument('--output', type=str,
                         default='results/protonet_gadf2d/')
+    parser.add_argument('--embeddings_root', type=str, default=None,
+                        help='Optional external root with per-task embedding '
+                             'subfolders')
 
     # Training
     parser.add_argument('--episodes', type=int, default=5000)
