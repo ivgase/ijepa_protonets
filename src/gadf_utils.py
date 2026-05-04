@@ -4,6 +4,24 @@ import json
 import numpy as np
 
 
+def apply_savitzky_golay(X, window_length=15, polyorder=2, deriv=0):
+    """Suaviza espectros con filtro Savitzky-Golay antes de la transformación GADF.
+
+    Args:
+        X: (N, L) float32 — espectros crudos
+        window_length: longitud de ventana (debe ser impar; se ajusta si no lo es)
+        polyorder: orden del polinomio (< window_length)
+        deriv: 0 = suavizado puro, 1 = primera derivada espectral
+    Returns:
+        X_filtered: (N, L) float32
+    """
+    from scipy.signal import savgol_filter
+    wl = window_length if window_length % 2 == 1 else window_length + 1
+    wl = min(wl, X.shape[1] if X.shape[1] % 2 == 1 else X.shape[1] - 1)
+    return savgol_filter(X, window_length=wl, polyorder=polyorder,
+                         deriv=deriv, axis=1).astype(X.dtype)
+
+
 def paa_resample(X, output_size=224):
     """Replicate pyts PAA (non-overlapping) resampling.
 

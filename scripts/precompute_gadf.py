@@ -49,10 +49,25 @@ def main():
                         help="Ruta al JSON con min/max globales PAA")
     parser.add_argument("--output",
                         default=None,
-                        help="Ruta de salida del HDF5 (por defecto: data/gadf_224_v2[_diagonal].h5)")
+                        help="Ruta de salida del HDF5 (por defecto: data/gadf_224_v2[_diagonal][_savgol].h5)")
+    parser.add_argument("--savgol", action="store_true",
+                        help="Aplica filtro Savitzky-Golay antes de la transformación GADF")
+    parser.add_argument("--savgol_window", type=int, default=15,
+                        help="Longitud de ventana SG (impar, default: 15)")
+    parser.add_argument("--savgol_polyorder", type=int, default=2,
+                        help="Orden del polinomio SG (default: 2)")
+    parser.add_argument("--savgol_deriv", type=int, default=0,
+                        help="Derivada SG: 0=suavizado, 1=primera derivada (default: 0)")
     args = parser.parse_args()
 
-    suffix = "_diagonal" if args.encode_diagonal else ""
+    suffix = ""
+    if args.encode_diagonal:
+        suffix += "_diagonal"
+    if args.savgol:
+        if args.savgol_deriv == 0:
+            suffix += "_savgol"
+        else:
+            suffix += f"_savgol_d{args.savgol_deriv}"
     output_path = args.output or os.path.join(_PROJECT_DATA, f"gadf_224_v2{suffix}.h5")
 
     # Cargar stats globales si se usa diagonal
@@ -72,6 +87,12 @@ def main():
         dfs.append(df)
 
     X = np.concatenate([df.values for df in dfs], axis=0).astype(np.float32)
+
+    if args.savgol:
+        from src.gadf_utils import apply_savitzky_golay
+        X = apply_savitzky_golay(X, args.savgol_window, args.savgol_polyorder, args.savgol_deriv)
+        print(f"Savitzky-Golay aplicado (window={args.savgol_window}, poly={args.savgol_polyorder}, deriv={args.savgol_deriv})")
+
     N = X.shape[0]
     print(f"\nTotal: {N} muestras x {X.shape[1]} wavelengths")
 

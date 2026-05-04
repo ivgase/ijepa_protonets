@@ -259,7 +259,7 @@ class SimpleTask2D:
 
     def __init__(self, data_path, target_column=None,
                  image_size=224, norm_stats=None, scale_y=True,
-                 device='cuda', global_stats=None):
+                 device='cuda', global_stats=None, savgol_params=None):
         self.name = os.path.basename(data_path.rstrip('/'))
         self.data_path = data_path
         self.device = device
@@ -297,8 +297,8 @@ class SimpleTask2D:
 
         if os.path.exists(supp_pt) and os.path.exists(query_pt):
             # Modo pre-computado: cargar tensores directamente
-            self.support_x = torch.load(supp_pt, map_location="cpu").float()[supp_valid]
-            self.query_x = torch.load(query_pt, map_location="cpu").float()[query_valid]
+            self.support_x = torch.load(supp_pt, map_location="cpu").float()[supp_valid.values]
+            self.query_x = torch.load(query_pt, map_location="cpu").float()[query_valid.values]
             print(f"  Loaded precomputed GADF: support {tuple(self.support_x.shape)}, "
                   f"query {tuple(self.query_x.shape)}")
         else:
@@ -310,6 +310,10 @@ class SimpleTask2D:
 
             supp_np = support_x.values.astype(np.float32)
             query_np = query_x.values.astype(np.float32)
+            if savgol_params is not None:
+                from src.gadf_utils import apply_savitzky_golay
+                supp_np = apply_savitzky_golay(supp_np, **savgol_params)
+                query_np = apply_savitzky_golay(query_np, **savgol_params)
             print(f"  Computing GADF ({image_size}x{image_size}) for support ({supp_np.shape[0]}) "
                   f"and query ({query_np.shape[0]}) on-the-fly ...")
             self.support_x = spectra_to_gadf(supp_np, image_size=image_size)
@@ -370,15 +374,14 @@ class SimpleTask2D:
                 'query_targets': self.query_y[query_idx].to(self.device),
             }
 
-        # Fallback: generar split fijo
-        target_suffix = f"_{self.target_column}" if self.target_column else ""
-        fixed_file = os.path.join(self.data_path, f"fixed_split_{shots}shots{target_suffix}.csv")
+        # Fallback: generar split fijo con el mismo formato que fixed_val_support/query_*shots.csv
+        supp_fallback = os.path.join(self.data_path, f"fixed_val_support_{shots}shots.csv")
+        query_fallback = os.path.join(self.data_path, f"fixed_val_query_{shots}shots.csv")
 
         regenerate = False
-        if os.path.exists(fixed_file):
-            val = pd.read_csv(fixed_file, index_col=0)
-            support_idx = val['support_idx'].values
-            query_idx = val['query_idx'].values
+        if os.path.exists(supp_fallback) and os.path.exists(query_fallback):
+            support_idx = pd.read_csv(supp_fallback, index_col=0)['support_idx'].values
+            query_idx = pd.read_csv(query_fallback, index_col=0)['query_idx'].values
             if support_idx.max() >= self.support_x.shape[0] or query_idx.max() >= self.query_x.shape[0]:
                 regenerate = True
         else:
@@ -389,8 +392,8 @@ class SimpleTask2D:
             n_query = min(queries, self.query_x.shape[0])
             support_idx = np.random.choice(self.support_x.shape[0], n_support, replace=False)
             query_idx = np.random.choice(self.query_x.shape[0], n_query, replace=False)
-            val = pd.DataFrame({'support_idx': support_idx, 'query_idx': query_idx})
-            val.to_csv(fixed_file)
+            pd.DataFrame({'support_idx': support_idx}).to_csv(supp_fallback)
+            pd.DataFrame({'query_idx': query_idx}).to_csv(query_fallback)
 
         return {
             'support_features': self.support_x[support_idx].to(self.device),
@@ -526,6 +529,14 @@ def get_args_parser():
                    help='Codifica magnitud espectral en la diagonal GADF')
     p.add_argument('--gadf_global_stats', default='data/gadf_paa_global_stats.json',
                    type=str, help='Ruta al JSON con min/max globales PAA')
+    p.add_argument('--savgol', action='store_true',
+                   help='Aplica filtro Savitzky-Golay antes de la transformación GADF (solo modo on-the-fly)')
+    p.add_argument('--savgol_window', type=int, default=15,
+                   help='Longitud de ventana SG (impar, default: 15)')
+    p.add_argument('--savgol_polyorder', type=int, default=2,
+                   help='Orden del polinomio SG (default: 2)')
+    p.add_argument('--savgol_deriv', type=int, default=0,
+                   help='Derivada SG: 0=suavizado, 1=primera derivada (default: 0)')
 
     # Few-shot
     p.add_argument('--k_spt', type=int, default=25)
@@ -584,6 +595,14 @@ def main(args):
         global_stats = load_global_stats(args.gadf_global_stats)
         print(f"Diagonal encoding ON (min={global_stats[0]:.4f}, max={global_stats[1]:.4f})")
 
+    # -- Savitzky-Golay (solo path on-the-fly; ignorado si existen .pt precomputados)
+    savgol_params = None
+    if args.savgol:
+        savgol_params = dict(window_length=args.savgol_window,
+                             polyorder=args.savgol_polyorder,
+                             deriv=args.savgol_deriv)
+        print(f"Savitzky-Golay ON (window={args.savgol_window}, poly={args.savgol_polyorder}, deriv={args.savgol_deriv})")
+
     # -- Cargar tareas
     if args.region_tasks:
         splits_file = os.path.join(args.data_path, 'splits.csv')
@@ -607,7 +626,8 @@ def main(args):
                     data_path=task_dir, target_column=None,
                     image_size=args.gadf_image_size,
                     norm_stats=norm_stats, scale_y=scale_y,
-                    device=device, global_stats=global_stats)
+                    device=device, global_stats=global_stats,
+                    savgol_params=savgol_params)
                 t.name = tname
                 tasks.append(t)
             except Exception as e:
@@ -628,7 +648,8 @@ def main(args):
                 data_path=args.data_path, target_column=tc,
                 image_size=args.gadf_image_size,
                 norm_stats=norm_stats, scale_y=scale_y,
-                device=device, global_stats=global_stats)
+                device=device, global_stats=global_stats,
+                savgol_params=savgol_params)
             t.name = f"{t.name}_{tc}"
             tasks.append(t)
         print(f"\nLoaded {len(tasks)} task(s) in simple mode")
@@ -855,6 +876,9 @@ def main(args):
     # Summary
     # -------------------------------------------------------------------
     results_df = pd.DataFrame(results_per_task)
+    if results_df.empty:
+        print("WARNING: No task results — all tasks were skipped. Check data_path and splits.")
+        return
     metric_cols = ['mse', 'mae', 'rmse', 'r2']
     summary_rows = []
 

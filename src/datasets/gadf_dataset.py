@@ -24,7 +24,8 @@ class GADFDataset(torch.utils.data.Dataset):
         image_size=224,
         precomputed=True,
         transform=None,
-        global_stats=None
+        global_stats=None,
+        savgol_params=None
     ):
         self.precomputed = precomputed
         self.transform = transform
@@ -43,6 +44,9 @@ class GADFDataset(torch.utils.data.Dataset):
             assert csv_path is not None, "csv_path requerido en modo on-the-fly"
             from pyts.image import GramianAngularField
             self.spectra = pd.read_csv(csv_path, index_col=0).values.astype(np.float32)
+            if savgol_params is not None:
+                from src.gadf_utils import apply_savitzky_golay
+                self.spectra = apply_savitzky_golay(self.spectra, **savgol_params)
             self._len = len(self.spectra)
             self.gaf = GramianAngularField(image_size=image_size, method="difference")
             logger.info(f"GADFDataset (on-the-fly): {self._len} muestras desde {csv_path}")

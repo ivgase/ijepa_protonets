@@ -56,14 +56,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # ============================================================================
 
 def compute_gadf(csv_path, image_size, batch_size=256,
-                 global_min=None, global_max=None):
+                 global_min=None, global_max=None, savgol_params=None):
     """Lee un CSV de espectros y devuelve un tensor GADF (N, 1, H, W) float16.
 
     Si global_min/global_max se proporcionan, codifica la magnitud espectral
     normalizada globalmente en la diagonal de la GADF.
+    Si savgol_params es un dict con window_length/polyorder/deriv, aplica
+    filtro Savitzky-Golay antes de la transformación GADF.
     """
     df = pd.read_csv(csv_path, index_col=0)
     X = df.values.astype(np.float32)
+
+    if savgol_params is not None:
+        from src.gadf_utils import apply_savitzky_golay
+        X = apply_savitzky_golay(X, **savgol_params)
+
     N = X.shape[0]
 
     gaf = GramianAngularField(image_size=image_size, method="difference")
@@ -103,6 +110,14 @@ def main():
                             os.path.abspath(__file__))),
                             "data", "gadf_paa_global_stats.json"),
                         help="Ruta al JSON con min/max globales PAA")
+    parser.add_argument("--savgol", action="store_true",
+                        help="Aplica filtro Savitzky-Golay antes de la transformación GADF")
+    parser.add_argument("--savgol_window", type=int, default=15,
+                        help="Longitud de ventana SG (impar, default: 15)")
+    parser.add_argument("--savgol_polyorder", type=int, default=2,
+                        help="Orden del polinomio SG (default: 2)")
+    parser.add_argument("--savgol_deriv", type=int, default=0,
+                        help="Derivada SG: 0=suavizado, 1=primera derivada (default: 0)")
     args = parser.parse_args()
 
     # Cargar stats globales si se usa diagonal
@@ -111,6 +126,13 @@ def main():
         from src.gadf_utils import load_global_stats
         global_min, global_max = load_global_stats(args.stats_path)
         print(f"Diagonal encoding ON (min={global_min:.4f}, max={global_max:.4f})")
+
+    savgol_params = None
+    if args.savgol:
+        savgol_params = dict(window_length=args.savgol_window,
+                             polyorder=args.savgol_polyorder,
+                             deriv=args.savgol_deriv)
+        print(f"Savitzky-Golay ON (window={args.savgol_window}, poly={args.savgol_polyorder}, deriv={args.savgol_deriv})")
 
     src = os.path.abspath(args.src)
     dst = os.path.abspath(args.dst)
@@ -150,7 +172,7 @@ def main():
                 continue
 
             tensor = compute_gadf(csv_path, args.image_size, args.batch_size,
-                                  global_min, global_max)
+                                  global_min, global_max, savgol_params)
             torch.save(tensor, pt_path)
             total_samples += tensor.shape[0]
             total_files += 1
