@@ -336,6 +336,10 @@ class SimpleTask2D:
         supp_y_vals = support_y.values.reshape(-1, 1).astype(np.float32)
         query_y_vals = query_y.values.reshape(-1, 1).astype(np.float32)
 
+        # Pool unificado de y RAW (antes de escalar) para K-fold CV
+        self.full_y_raw = np.concatenate([supp_y_vals, query_y_vals], axis=0).ravel()
+        self._scale_y = scale_y
+
         if scale_y:
             self.y_scaler = StandardScaler()
             supp_y_vals = self.y_scaler.fit_transform(supp_y_vals)
@@ -346,8 +350,12 @@ class SimpleTask2D:
         self.support_y = torch.from_numpy(supp_y_vals)
         self.query_y = torch.from_numpy(query_y_vals)
 
+        # Pool unificado de X para K-fold CV (concatenar support y query ya normalizados)
+        self.full_x = torch.cat([self.support_x, self.query_x], dim=0)
+
         print(f"  Loaded SimpleTask2D '{self.name}': "
-              f"support={self.support_x.shape}, query={self.query_x.shape}")
+              f"support={self.support_x.shape}, query={self.query_x.shape}, "
+              f"full_pool={self.full_x.shape[0]}")
 
     def sample_fixed(self, shots, queries):
         """Muestrea soporte/query con splits fijos reproducibles."""
@@ -401,6 +409,49 @@ class SimpleTask2D:
             'query_features': self.query_x[query_idx].to(self.device),
             'query_targets': self.query_y[query_idx].to(self.device),
         }
+
+    def iter_folds(self, k_spt, seed=42):
+        """K-fold CV sobre el pool unificado support∪query.
+
+        Yields K = ceil(N / k_spt) folds; cada instancia es support exactamente
+        una vez y query en todos los demás folds.  El StandardScaler se re-ajusta
+        por fold sólo sobre el support de ese fold.
+        """
+        N = self.full_x.shape[0]
+        if N < k_spt:
+            print(f"  [CV] WARN: task '{self.name}' sólo tiene {N} instancias "
+                  f"({k_spt} requeridas para support). Saltando.")
+            return
+
+        rng = np.random.RandomState(seed)
+        perm = rng.permutation(N)
+        K = (N + k_spt - 1) // k_spt  # ceil
+
+        for fold_idx in range(K):
+            spt_idx = perm[fold_idx * k_spt: (fold_idx + 1) * k_spt]
+            qry_idx = np.setdiff1d(perm, spt_idx, assume_unique=True)
+
+            spt_y_raw = self.full_y_raw[spt_idx].reshape(-1, 1).astype(np.float32)
+            qry_y_raw = self.full_y_raw[qry_idx].reshape(-1, 1).astype(np.float32)
+
+            if self._scale_y:
+                fold_scaler = StandardScaler()
+                spt_y = fold_scaler.fit_transform(spt_y_raw).astype(np.float32)
+                qry_y = fold_scaler.transform(qry_y_raw).astype(np.float32)
+            else:
+                fold_scaler = None
+                spt_y = spt_y_raw
+                qry_y = qry_y_raw
+
+            yield {
+                'fold_idx': fold_idx,
+                'num_folds': K,
+                'support_features': self.full_x[spt_idx].to(self.device),
+                'support_targets': torch.from_numpy(spt_y).to(self.device),
+                'query_features': self.full_x[qry_idx].to(self.device),
+                'query_targets': torch.from_numpy(qry_y).to(self.device),
+                'y_scaler': fold_scaler,
+            }
 
     def query_dataloader(self, batch_size=32):
         indices = torch.arange(self.query_x.shape[0])
@@ -549,8 +600,12 @@ def get_args_parser():
     p.add_argument('--target_column', default=None, type=str)
     p.add_argument('--region_tasks', action='store_true')
 
-    # Repeats
+    # Repeats / eval mode
     p.add_argument('--n_repeats', type=int, default=3)
+    p.add_argument('--eval_mode', type=str, default='fixed',
+                   choices=['fixed', 'cv'],
+                   help='fixed: usa fixed_val_*shots.csv (legacy); '
+                        'cv: K-fold CV sobre pool unificado support∪query')
 
     return p
 
@@ -664,7 +719,14 @@ def main(args):
     results_per_task = []
     predictions_all_tasks = []
     n_repeats = args.n_repeats
-    print(f"\nRunning {n_repeats} repeat(s) per task")
+    eval_mode = args.eval_mode
+
+    if eval_mode == 'cv':
+        print(f"\nEval mode: K-fold CV (k_spt={args.k_spt}, seed=42)")
+        if n_repeats != 3:
+            print("  WARNING: --n_repeats ignorado en modo cv (las repeticiones son los folds)")
+    else:
+        print(f"\nEval mode: fixed — {n_repeats} repeat(s) per task")
 
     for task_idx, task in enumerate(tasks):
         task_name = task.name
@@ -698,15 +760,34 @@ def main(args):
             print(f"  Features: support {tuple(task.support_x.shape)}, "
                   f"query {tuple(task.query_x.shape)}")
 
+            # En modo cv, full_x también debe contener features extraídas
+            if eval_mode == 'cv':
+                task.full_x = torch.cat([task.support_x, task.query_x], dim=0)
+
             del encoder
             torch.cuda.empty_cache()
 
-        for repeat in range(1, n_repeats + 1):
-            print(f"\n--- Repeat {repeat}/{n_repeats} ---")
-            torch.manual_seed(42 + repeat)
-            np.random.seed(42 + repeat)
+        # Generar iterador de episodios según eval_mode
+        if eval_mode == 'cv':
+            def _episodes():
+                for fold in task.iter_folds(args.k_spt, seed=42):
+                    yield fold['fold_idx'] + 1, fold['num_folds'], fold
+            episode_iter = _episodes()
+        else:
+            def _episodes():
+                for repeat in range(1, n_repeats + 1):
+                    torch.manual_seed(42 + repeat)
+                    np.random.seed(42 + repeat)
+                    data = task.sample_fixed(args.k_spt, args.k_qry)
+                    yield repeat, n_repeats, data
+            episode_iter = _episodes()
 
-            data = task.sample_fixed(args.k_spt, args.k_qry)
+        for repeat, total_episodes, data in episode_iter:
+            if eval_mode == 'cv':
+                print(f"\n--- Fold {repeat}/{total_episodes} ---")
+            else:
+                print(f"\n--- Repeat {repeat}/{total_episodes} ---")
+
             support_x = data['support_features']
             support_y = data['support_targets']
             query_x = data['query_features']
@@ -827,7 +908,7 @@ def main(args):
                             dpi=150)
                 plt.close(fig)
 
-            # -- Evaluate best model on full query set
+            # -- Evaluate best model on query set
             best_path = os.path.join(args.save_path, f"{task_name}_best.pth")
             try:
                 model.load_state_dict(torch.load(best_path, map_location=device))
@@ -838,17 +919,33 @@ def main(args):
 
             y_true, y_pred = [], []
             mse_total, mae_total, num_instances = 0.0, 0.0, 0
-            query_dl = task.query_dataloader()
 
-            with torch.no_grad():
-                for x, y, idx in query_dl:
-                    x, y = x.to(device), y.to(device)
-                    outputs = model(x)
-                    mse_total += ((outputs - y) ** 2).sum().item()
-                    mae_total += torch.abs(outputs - y).sum().item()
-                    num_instances += y.size(0)
-                    y_true.extend(y.cpu().numpy().flatten().tolist())
-                    y_pred.extend(outputs.cpu().numpy().flatten().tolist())
+            if eval_mode == 'cv':
+                # Evaluar sobre el query set del fold (ya está en tensores)
+                eval_dl = DataLoader(
+                    TensorDataset(query_x, query_y),
+                    batch_size=args.batch_size, shuffle=False)
+                with torch.no_grad():
+                    for x, y in eval_dl:
+                        x, y = x.to(device), y.to(device)
+                        outputs = model(x)
+                        mse_total += ((outputs - y) ** 2).sum().item()
+                        mae_total += torch.abs(outputs - y).sum().item()
+                        num_instances += y.size(0)
+                        y_true.extend(y.cpu().numpy().flatten().tolist())
+                        y_pred.extend(outputs.cpu().numpy().flatten().tolist())
+            else:
+                # Modo fixed: evaluar sobre el query set completo original
+                query_dl = task.query_dataloader()
+                with torch.no_grad():
+                    for x, y, idx in query_dl:
+                        x, y = x.to(device), y.to(device)
+                        outputs = model(x)
+                        mse_total += ((outputs - y) ** 2).sum().item()
+                        mae_total += torch.abs(outputs - y).sum().item()
+                        num_instances += y.size(0)
+                        y_true.extend(y.cpu().numpy().flatten().tolist())
+                        y_pred.extend(outputs.cpu().numpy().flatten().tolist())
 
             mse = mse_total / num_instances
             mae = mae_total / num_instances
@@ -857,7 +954,8 @@ def main(args):
             from sklearn.metrics import r2_score
             r2 = r2_score(y_true, y_pred)
 
-            print(f"\n  Repeat {repeat} Results for {task_name}:")
+            label = f"Fold {repeat}/{total_episodes}" if eval_mode == 'cv' else f"Repeat {repeat}"
+            print(f"\n  {label} Results for {task_name}:")
             print(f"  MSE: {mse:.6f} | MAE: {mae:.6f} | "
                   f"RMSE: {rmse:.6f} | R2: {r2:.6f}")
 
@@ -913,24 +1011,45 @@ def main(args):
     final_df.to_csv(os.path.join(args.save_path, 'results_per_task.csv'),
                     index=False)
 
-    # Resumen por repetición
-    repeat_summary_rows = []
-    for rep in range(1, n_repeats + 1):
-        rep_data = results_df[results_df['repeat'] == rep]
-        row = {'repeat': rep}
+    # Resumen por repetición/fold
+    if eval_mode == 'cv':
+        # En cv los folds varían por tarea; resumen por fold sobre todas las tareas
+        fold_ids = sorted(results_df['repeat'].unique())
+        repeat_summary_rows = []
+        for rep in fold_ids:
+            rep_data = results_df[results_df['repeat'] == rep]
+            row = {'fold': rep, 'n_tasks': len(rep_data)}
+            for col in metric_cols:
+                row[col] = rep_data[col].mean()
+            repeat_summary_rows.append(row)
+        repeat_summary_df = pd.DataFrame(repeat_summary_rows)
+        mean_row = {'fold': 'MEAN', 'n_tasks': repeat_summary_df['n_tasks'].mean()}
         for col in metric_cols:
-            row[col] = rep_data[col].mean()
-        repeat_summary_rows.append(row)
-    repeat_summary_df = pd.DataFrame(repeat_summary_rows)
-    mean_row = {'repeat': 'MEAN'}
-    for col in metric_cols:
-        mean_row[col] = repeat_summary_df[col].mean()
-    repeat_summary_df = pd.concat([repeat_summary_df,
-                                    pd.DataFrame([mean_row])],
-                                   ignore_index=True)
-    repeat_summary_df.to_csv(os.path.join(args.save_path,
-                                           'results_per_repeat.csv'),
-                             index=False)
+            mean_row[col] = repeat_summary_df[col].mean()
+        repeat_summary_df = pd.concat([repeat_summary_df,
+                                        pd.DataFrame([mean_row])],
+                                       ignore_index=True)
+        repeat_summary_df.to_csv(os.path.join(args.save_path,
+                                               'results_per_fold.csv'),
+                                 index=False)
+    else:
+        repeat_summary_rows = []
+        for rep in range(1, n_repeats + 1):
+            rep_data = results_df[results_df['repeat'] == rep]
+            row = {'repeat': rep}
+            for col in metric_cols:
+                row[col] = rep_data[col].mean()
+            repeat_summary_rows.append(row)
+        repeat_summary_df = pd.DataFrame(repeat_summary_rows)
+        mean_row = {'repeat': 'MEAN'}
+        for col in metric_cols:
+            mean_row[col] = repeat_summary_df[col].mean()
+        repeat_summary_df = pd.concat([repeat_summary_df,
+                                        pd.DataFrame([mean_row])],
+                                       ignore_index=True)
+        repeat_summary_df.to_csv(os.path.join(args.save_path,
+                                               'results_per_repeat.csv'),
+                                 index=False)
 
     if predictions_all_tasks:
         predictions_df = pd.concat(predictions_all_tasks, ignore_index=True)

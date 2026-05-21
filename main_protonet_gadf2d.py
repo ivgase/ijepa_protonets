@@ -47,52 +47,91 @@ except ImportError:
 # Evaluation helper
 # ============================================================================
 
-def evaluate_split(protonet, dataset, k_spt, k_qry, fixed=True):
+def evaluate_split(protonet, dataset, k_spt, k_qry, fixed=True, eval_mode='fixed'):
     """Evaluate ProtoNet on all tasks in a split.
+
+    eval_mode='fixed': usa sample_fixed (legacy) o sample (random).
+    eval_mode='cv':    K-fold CV sobre el pool unificado support∪query.
 
     Returns per-task and aggregated metrics.
     """
     results = []
 
     for task in dataset:
-        # Sample support set
-        if fixed:
-            sampled = task.sample_fixed(k_spt, k_qry)
+        if eval_mode == 'cv':
+            # K-fold CV: recolectar métricas por fold y promediarlas
+            fold_r2s, fold_mses, fold_maes, fold_rmses = [], [], [], []
+            y_true_all, y_pred_all = [], []
+
+            for fold in task.iter_folds(k_spt, seed=42):
+                x_spt = fold['support_features']
+                y_spt = fold['support_targets']
+                x_qry = fold['query_features']
+                y_qry = fold['query_targets']
+
+                fold_true, fold_pred = [], []
+                batch_size = 64
+                for start in range(0, x_qry.shape[0], batch_size):
+                    x_q = x_qry[start:start + batch_size].to(protonet.dev)
+                    y_q = y_qry[start:start + batch_size].to(protonet.dev)
+                    _, _, _, _, preds = protonet.evaluate(x_spt, y_spt, x_q, y_q)
+                    fold_true.extend(y_q.cpu().numpy().ravel().tolist())
+                    fold_pred.extend(preds.ravel().tolist())
+
+                yt = np.array(fold_true)
+                yp = np.array(fold_pred)
+                fold_mses.append(np.mean((yt - yp) ** 2))
+                fold_maes.append(np.mean(np.abs(yt - yp)))
+                fold_rmses.append(np.sqrt(fold_mses[-1]))
+                fold_r2s.append(r2_score(yt, yp) if len(yt) > 1 else 0.0)
+                y_true_all.extend(fold_true)
+                y_pred_all.extend(fold_pred)
+
+            if not fold_r2s:
+                continue
+
+            results.append({
+                'task': task.name,
+                'mse': np.mean(fold_mses),
+                'mae': np.mean(fold_maes),
+                'rmse': np.mean(fold_rmses),
+                'r2': np.mean(fold_r2s),
+                'y_true': y_true_all,
+                'y_pred': y_pred_all,
+                'y_idx': list(range(len(y_true_all))),
+            })
         else:
-            sampled = task.sample(k_spt, k_qry)
+            # Modo fixed / random
+            if fixed:
+                sampled = task.sample_fixed(k_spt, k_qry)
+            else:
+                sampled = task.sample(k_spt, k_qry)
 
-        x_spt = sampled['support_features']
-        y_spt = sampled['support_targets']
+            x_spt = sampled['support_features']
+            y_spt = sampled['support_targets']
 
-        # Evaluate on full query set
-        y_true_all = []
-        y_pred_all = []
-        y_idx_all = []
+            y_true_all, y_pred_all, y_idx_all = [], [], []
+            query_dl = task.query_dataloader(batch_size=64)
+            for x_q, y_q, idx in query_dl:
+                x_q = x_q.to(protonet.dev)
+                y_q = y_q.to(protonet.dev)
+                _, _, _, _, preds = protonet.evaluate(x_spt, y_spt, x_q, y_q)
+                y_true_all.extend(y_q.cpu().numpy().ravel().tolist())
+                y_pred_all.extend(preds.ravel().tolist())
+                y_idx_all.extend(idx.numpy().tolist())
 
-        query_dl = task.query_dataloader(batch_size=64)
-        for x_q, y_q, idx in query_dl:
-            x_q = x_q.to(protonet.dev)
-            y_q = y_q.to(protonet.dev)
-            _, _, _, _, preds = protonet.evaluate(x_spt, y_spt, x_q, y_q)
-            y_true_all.extend(y_q.cpu().numpy().ravel().tolist())
-            y_pred_all.extend(preds.ravel().tolist())
-            y_idx_all.extend(idx.numpy().tolist())
+            y_true_arr = np.array(y_true_all)
+            y_pred_arr = np.array(y_pred_all)
 
-        y_true_arr = np.array(y_true_all)
-        y_pred_arr = np.array(y_pred_all)
+            results.append({
+                'task': task.name,
+                'mse': np.mean((y_true_arr - y_pred_arr) ** 2),
+                'mae': np.mean(np.abs(y_true_arr - y_pred_arr)),
+                'rmse': np.sqrt(np.mean((y_true_arr - y_pred_arr) ** 2)),
+                'r2': r2_score(y_true_arr, y_pred_arr) if len(y_true_arr) > 1 else 0.0,
+                'y_true': y_true_all, 'y_pred': y_pred_all, 'y_idx': y_idx_all,
+            })
 
-        mse = np.mean((y_true_arr - y_pred_arr) ** 2)
-        mae = np.mean(np.abs(y_true_arr - y_pred_arr))
-        rmse = np.sqrt(mse)
-        r2 = r2_score(y_true_arr, y_pred_arr) if len(y_true_arr) > 1 else 0.0
-
-        results.append({
-            'task': task.name,
-            'mse': mse, 'mae': mae, 'rmse': rmse, 'r2': r2,
-            'y_true': y_true_all, 'y_pred': y_pred_all, 'y_idx': y_idx_all,
-        })
-
-    # Aggregate
     agg = {
         'mse': np.mean([r['mse'] for r in results]),
         'mae': np.mean([r['mae'] for r in results]),
@@ -210,7 +249,8 @@ def main(args):
             # --- Validate ---
             if episode % args.val_freq == 0 or episode == args.episodes - 1:
                 val_metrics = evaluate_split(
-                    protonet, val_data, args.k_spt, args.k_qry, fixed=True)
+                    protonet, val_data, args.k_spt, args.k_qry,
+                    fixed=(args.eval_mode == 'fixed'), eval_mode=args.eval_mode)
                 last_val_mse = val_metrics['mse']
                 last_val_r2 = val_metrics['r2']
 
@@ -244,7 +284,8 @@ def main(args):
         # --- Test with best model ---
         protonet.load(best_model_path)
         test_metrics = evaluate_split(
-            protonet, test_data, args.k_spt, args.k_qry, fixed=True)
+            protonet, test_data, args.k_spt, args.k_qry,
+            fixed=(args.eval_mode == 'fixed'), eval_mode=args.eval_mode)
 
         print(f'\nTest | MSE: {test_metrics["mse"]:.4f} | '
               f'RMSE: {test_metrics["rmse"]:.4f} | '
@@ -378,6 +419,12 @@ if __name__ == '__main__':
                              'patches: load emb_supp_patches.pt [N,P,D]')
     parser.add_argument('--resnet_dim', type=int, default=512,
                         help='EmbResNet1D output dimension (default 512)')
+
+    # Eval mode
+    parser.add_argument('--eval_mode', type=str, default='fixed',
+                        choices=['fixed', 'cv'],
+                        help='fixed: usa fixed_val_*shots.csv (legacy); '
+                             'cv: K-fold CV sobre pool unificado support∪query')
 
     # W&B
     parser.add_argument('--wandb_project', type=str, default='protonet-gadf2d')

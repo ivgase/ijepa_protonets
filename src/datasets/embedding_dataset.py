@@ -82,6 +82,18 @@ class EmbeddingTask:
         self.support_idx = torch.arange(self.support_x.shape[0])
         self.query_idx = torch.arange(self.query_x.shape[0])
 
+        # Pool unificado para K-fold CV
+        self._scale_y = scale_y
+        # Recuperar y raw (antes de escalar): desescalar support y query si aplicó scaler
+        if scale_y:
+            sy_raw = self.scaler.inverse_transform(sy.reshape(-1, 1)).ravel()
+            qy_raw = self.scaler.inverse_transform(qy.reshape(-1, 1)).ravel()
+        else:
+            sy_raw = sy
+            qy_raw = qy
+        self.full_y_raw = np.concatenate([sy_raw, qy_raw], axis=0).astype(np.float32)
+        self.full_x = torch.cat([self.support_x, self.query_x], dim=0)
+
     def sample(self, shots, queries):
         """Random sample for episodic training."""
         n_s = self.support_x.shape[0]
@@ -131,6 +143,50 @@ class EmbeddingTask:
             'query_features': self.query_x[qi].to(self.device),
             'query_targets': self.query_y[qi].to(self.device),
         }
+
+    def iter_folds(self, k_spt, seed=42):
+        """K-fold CV sobre el pool unificado support∪query.
+
+        Yields K = ceil(N / k_spt) folds; cada instancia es support exactamente
+        una vez y query en todos los demás folds.  El StandardScaler se re-ajusta
+        por fold sólo sobre el support de ese fold.
+        """
+        N = self.full_x.shape[0]
+        if N < k_spt:
+            import warnings
+            warnings.warn(f"Task '{self.name}' tiene sólo {N} instancias "
+                          f"({k_spt} requeridas). Saltando.")
+            return
+
+        rng = np.random.RandomState(seed)
+        perm = rng.permutation(N)
+        K = (N + k_spt - 1) // k_spt  # ceil
+
+        for fold_idx in range(K):
+            spt_idx = perm[fold_idx * k_spt: (fold_idx + 1) * k_spt]
+            qry_idx = np.setdiff1d(perm, spt_idx, assume_unique=True)
+
+            spt_y_raw = self.full_y_raw[spt_idx].reshape(-1, 1)
+            qry_y_raw = self.full_y_raw[qry_idx].reshape(-1, 1)
+
+            if self._scale_y:
+                fold_scaler = StandardScaler()
+                spt_y = fold_scaler.fit_transform(spt_y_raw).ravel().astype(np.float32)
+                qry_y = fold_scaler.transform(qry_y_raw).ravel().astype(np.float32)
+            else:
+                fold_scaler = None
+                spt_y = spt_y_raw.ravel().astype(np.float32)
+                qry_y = qry_y_raw.ravel().astype(np.float32)
+
+            yield {
+                'fold_idx': fold_idx,
+                'num_folds': K,
+                'support_features': self.full_x[spt_idx].to(self.device),
+                'support_targets': torch.from_numpy(spt_y).unsqueeze(1).to(self.device),
+                'query_features': self.full_x[qry_idx].to(self.device),
+                'query_targets': torch.from_numpy(qry_y).unsqueeze(1).to(self.device),
+                'y_scaler': fold_scaler,
+            }
 
     def query_dataloader(self, batch_size=32):
         """Full query set DataLoader for evaluation."""

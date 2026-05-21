@@ -213,21 +213,25 @@ def main(args):
 
     print(f'Loaded {len(tasks)} tasks')
 
-    # check that fixed_val files exist for the requested k_spt
-    _sample_task = tasks[0] if tasks else None
-    if _sample_task is not None:
-        _supp_csv = os.path.join(_sample_task.data_path,
-                                 f'fixed_val_support_{k_spt}shots.csv')
-        if not os.path.exists(_supp_csv):
-            available = sorted({
-                int(f.split('_')[3].replace('shots.csv', ''))
-                for f in os.listdir(_sample_task.data_path)
-                if f.startswith('fixed_val_support_') and f.endswith('shots.csv')
-            })
-            print(f'ERROR: fixed_val_support_{k_spt}shots.csv not found.')
-            print(f'Available shot counts: {available}')
-            print(f'Pass one of these as --k_spt')
-            sys.exit(1)
+    # En modo fixed, verificar que existan los fixed_val_*shots.csv
+    eval_mode = args.eval_mode
+    if eval_mode == 'fixed':
+        _sample_task = tasks[0] if tasks else None
+        if _sample_task is not None:
+            _supp_csv = os.path.join(_sample_task.data_path,
+                                     f'fixed_val_support_{k_spt}shots.csv')
+            if not os.path.exists(_supp_csv):
+                available = sorted({
+                    int(f.split('_')[3].replace('shots.csv', ''))
+                    for f in os.listdir(_sample_task.data_path)
+                    if f.startswith('fixed_val_support_') and f.endswith('shots.csv')
+                })
+                print(f'ERROR: fixed_val_support_{k_spt}shots.csv not found.')
+                print(f'Available shot counts: {available}')
+                print(f'Pass one of these as --k_spt, or use --eval_mode cv')
+                sys.exit(1)
+    else:
+        print(f'Eval mode: K-fold CV (k_spt={k_spt}, seed=42)')
 
     # -- W&B
     use_wandb = HAS_WANDB and bool(args.wandb_project)
@@ -246,7 +250,12 @@ def main(args):
     predictions_all_tasks = []
     n_repeats = args.n_repeats
 
-    print(f'\nRunning {n_repeats} repeat(s) per task')
+    if eval_mode == 'cv':
+        print(f'\nEval mode: K-fold CV (k_spt={k_spt}, seed=42)')
+        if n_repeats != 1:
+            print('  WARNING: --n_repeats ignorado en modo cv (las repeticiones son los folds)')
+    else:
+        print(f'\nRunning {n_repeats} repeat(s) per task')
 
     for task_idx, task in enumerate(tasks):
         task_name = task.name
@@ -254,66 +263,141 @@ def main(args):
         print(f'Task {task_idx + 1}/{len(tasks)}: {task_name}')
         print(f'{"="*60}')
 
-        for repeat in range(1, n_repeats + 1):
-            print(f'\n--- Repeat {repeat}/{n_repeats} ---')
+        if eval_mode == 'cv':
+            # K-fold CV: iterar folds, recolectar métricas por fold
+            fold_mses, fold_maes, fold_rmses, fold_r2s = [], [], [], []
+            all_y_true, all_y_pred = [], []
+            first_fold = True
 
-            # 1) Fixed support set
-            data = task.sample_fixed(k_spt, k_qry)
-            support_x = data['support_features']  # [k_spt, 1, H, W]
-            support_y = data['support_targets']   # [k_spt, 1]
-            print(f'Support: {support_x.shape[0]}, Full query: {task.query_x.shape[0]}')
+            for fold in task.iter_folds(k_spt, seed=42):
+                fold_idx = fold['fold_idx']
+                num_folds = fold['num_folds']
+                support_x = fold['support_features']
+                support_y = fold['support_targets']
+                query_x_fold = fold['query_features']
+                query_y_fold = fold['query_targets']
 
-            # 2) Encode support → prototypes (once)
-            with torch.no_grad():
-                supp_emb = encoder(support_x, masks=None)  # [k_spt, N, D]
-                if projection_type == 'transformer':
-                    supp_emb = proto_projection(supp_emb)  # [k_spt, out_dim]
-                else:
-                    supp_emb = proto_projection(supp_emb.mean(dim=1))  # [k_spt, out_dim]
+                print(f'\n--- Fold {fold_idx + 1}/{num_folds} ---')
+                print(f'Support: {support_x.shape[0]}, Query: {query_x_fold.shape[0]}')
 
-            # 3) Predict over FULL query set (same as finetuning evaluation)
-            y_true, y_pred = [], []
-            mse_total, mae_total, num_instances = 0.0, 0.0, 0
-
-            query_dl = task.query_dataloader(batch_size=args.batch_size)
-            with torch.no_grad():
-                for x, y, idx in query_dl:
-                    x, y = x.to(device), y.to(device)
-                    q_emb = encoder(x, masks=None)
+                with torch.no_grad():
+                    supp_emb = encoder(support_x, masks=None)
                     if projection_type == 'transformer':
-                        q_emb = proto_projection(q_emb)
+                        supp_emb = proto_projection(supp_emb)
                     else:
-                        q_emb = proto_projection(q_emb.mean(dim=1))
+                        supp_emb = proto_projection(supp_emb.mean(dim=1))
 
-                    dists = -torch.cdist(q_emb, supp_emb) / dist_temperature
-                    weights = torch.softmax(dists, dim=1)
-                    outputs = weights @ support_y  # [B, 1]
+                y_true_f, y_pred_f = [], []
+                mse_total = mae_total = num_instances = 0.0
+                for start in range(0, query_x_fold.shape[0], args.batch_size):
+                    xb = query_x_fold[start:start + args.batch_size].to(device)
+                    yb = query_y_fold[start:start + args.batch_size].to(device)
+                    with torch.no_grad():
+                        q_emb = encoder(xb, masks=None)
+                        if projection_type == 'transformer':
+                            q_emb = proto_projection(q_emb)
+                        else:
+                            q_emb = proto_projection(q_emb.mean(dim=1))
+                        dists = -torch.cdist(q_emb, supp_emb) / dist_temperature
+                        weights = torch.softmax(dists, dim=1)
+                        outputs = weights @ support_y
+                    mse_total += ((outputs - yb) ** 2).sum().item()
+                    mae_total += torch.abs(outputs - yb).sum().item()
+                    num_instances += yb.size(0)
+                    y_true_f.extend(yb.cpu().numpy().flatten().tolist())
+                    y_pred_f.extend(outputs.cpu().numpy().flatten().tolist())
 
-                    mse_total += ((outputs - y) ** 2).sum().item()
-                    mae_total += torch.abs(outputs - y).sum().item()
-                    num_instances += y.size(0)
-                    y_true.extend(y.cpu().numpy().flatten().tolist())
-                    y_pred.extend(outputs.cpu().numpy().flatten().tolist())
+                mse = mse_total / num_instances
+                mae = mae_total / num_instances
+                rmse = np.sqrt(mse)
+                r2 = r2_score(y_true_f, y_pred_f)
 
-            mse = mse_total / num_instances
-            mae = mae_total / num_instances
-            rmse = np.sqrt(mse)
-            r2 = r2_score(y_true, y_pred)
+                fold_mses.append(mse)
+                fold_maes.append(mae)
+                fold_rmses.append(rmse)
+                fold_r2s.append(r2)
+                all_y_true.extend(y_true_f)
+                all_y_pred.extend(y_pred_f)
 
-            print(f'\n  Repeat {repeat} Results for {task_name}:')
-            print(f'  MSE: {mse:.6f} | MAE: {mae:.6f} | '
-                  f'RMSE: {rmse:.6f} | R2: {r2:.6f}')
+                # Guardar por fold en results_per_task (repeat = fold_idx+1)
+                results_per_task.append({
+                    'task': task_name, 'repeat': fold_idx + 1,
+                    'mse': mse, 'mae': mae, 'rmse': rmse, 'r2': r2,
+                    'support_size': support_x.shape[0],
+                    'query_size': int(num_instances),
+                })
 
-            results_per_task.append({
-                'task': task_name, 'repeat': repeat,
-                'mse': mse, 'mae': mae, 'rmse': rmse, 'r2': r2,
-                'support_size': support_x.shape[0],
-                'query_size': num_instances,
-            })
-            predictions_all_tasks.append(pd.DataFrame({
-                'task': task_name, 'repeat': repeat,
-                'y_true': y_true, 'y_pred': y_pred,
-            }))
+            if fold_r2s:
+                print(f'\n  Task {task_name} CV summary '
+                      f'({len(fold_r2s)} folds):')
+                print(f'  R2:  {np.mean(fold_r2s):.6f} ± {np.std(fold_r2s):.6f}')
+                print(f'  RMSE: {np.mean(fold_rmses):.6f} ± {np.std(fold_rmses):.6f}')
+                predictions_all_tasks.append(pd.DataFrame({
+                    'task': task_name, 'repeat': 'cv',
+                    'y_true': all_y_true, 'y_pred': all_y_pred,
+                }))
+
+        else:
+            for repeat in range(1, n_repeats + 1):
+                print(f'\n--- Repeat {repeat}/{n_repeats} ---')
+
+                # 1) Fixed support set
+                data = task.sample_fixed(k_spt, k_qry)
+                support_x = data['support_features']
+                support_y = data['support_targets']
+                print(f'Support: {support_x.shape[0]}, Full query: {task.query_x.shape[0]}')
+
+                # 2) Encode support → prototypes (once)
+                with torch.no_grad():
+                    supp_emb = encoder(support_x, masks=None)
+                    if projection_type == 'transformer':
+                        supp_emb = proto_projection(supp_emb)
+                    else:
+                        supp_emb = proto_projection(supp_emb.mean(dim=1))
+
+                # 3) Predict over FULL query set
+                y_true, y_pred = [], []
+                mse_total, mae_total, num_instances = 0.0, 0.0, 0
+
+                query_dl = task.query_dataloader(batch_size=args.batch_size)
+                with torch.no_grad():
+                    for x, y, idx in query_dl:
+                        x, y = x.to(device), y.to(device)
+                        q_emb = encoder(x, masks=None)
+                        if projection_type == 'transformer':
+                            q_emb = proto_projection(q_emb)
+                        else:
+                            q_emb = proto_projection(q_emb.mean(dim=1))
+
+                        dists = -torch.cdist(q_emb, supp_emb) / dist_temperature
+                        weights = torch.softmax(dists, dim=1)
+                        outputs = weights @ support_y
+
+                        mse_total += ((outputs - y) ** 2).sum().item()
+                        mae_total += torch.abs(outputs - y).sum().item()
+                        num_instances += y.size(0)
+                        y_true.extend(y.cpu().numpy().flatten().tolist())
+                        y_pred.extend(outputs.cpu().numpy().flatten().tolist())
+
+                mse = mse_total / num_instances
+                mae = mae_total / num_instances
+                rmse = np.sqrt(mse)
+                r2 = r2_score(y_true, y_pred)
+
+                print(f'\n  Repeat {repeat} Results for {task_name}:')
+                print(f'  MSE: {mse:.6f} | MAE: {mae:.6f} | '
+                      f'RMSE: {rmse:.6f} | R2: {r2:.6f}')
+
+                results_per_task.append({
+                    'task': task_name, 'repeat': repeat,
+                    'mse': mse, 'mae': mae, 'rmse': rmse, 'r2': r2,
+                    'support_size': support_x.shape[0],
+                    'query_size': num_instances,
+                })
+                predictions_all_tasks.append(pd.DataFrame({
+                    'task': task_name, 'repeat': repeat,
+                    'y_true': y_true, 'y_pred': y_pred,
+                }))
 
     # -----------------------------------------------------------------------
     # Aggregation — identical to main_finetune_gadf2d.py:854-927
@@ -355,22 +439,40 @@ def main(args):
     final_df = pd.concat([results_df, pd.DataFrame(summary_rows)], ignore_index=True)
     final_df.to_csv(os.path.join(args.save_path, 'results_per_task.csv'), index=False)
 
-    # per-repeat summary
-    repeat_summary_rows = []
-    for rep in range(1, n_repeats + 1):
-        rep_data = results_df[results_df['repeat'] == rep]
-        row = {'repeat': rep}
+    # per-repeat/fold summary
+    if eval_mode == 'cv':
+        fold_ids = sorted(results_df['repeat'].unique())
+        repeat_summary_rows = []
+        for rep in fold_ids:
+            rep_data = results_df[results_df['repeat'] == rep]
+            row = {'fold': rep, 'n_tasks': len(rep_data)}
+            for col in metric_cols:
+                row[col] = rep_data[col].mean()
+            repeat_summary_rows.append(row)
+        repeat_summary_df = pd.DataFrame(repeat_summary_rows)
+        mean_row_rep = {'fold': 'MEAN', 'n_tasks': repeat_summary_df['n_tasks'].mean()}
         for col in metric_cols:
-            row[col] = rep_data[col].mean()
-        repeat_summary_rows.append(row)
-    repeat_summary_df = pd.DataFrame(repeat_summary_rows)
-    mean_row_rep = {'repeat': 'MEAN'}
-    for col in metric_cols:
-        mean_row_rep[col] = repeat_summary_df[col].mean()
-    repeat_summary_df = pd.concat([repeat_summary_df, pd.DataFrame([mean_row_rep])],
-                                  ignore_index=True)
-    repeat_summary_df.to_csv(os.path.join(args.save_path, 'results_per_repeat.csv'),
-                             index=False)
+            mean_row_rep[col] = repeat_summary_df[col].mean()
+        repeat_summary_df = pd.concat([repeat_summary_df, pd.DataFrame([mean_row_rep])],
+                                      ignore_index=True)
+        repeat_summary_df.to_csv(os.path.join(args.save_path, 'results_per_fold.csv'),
+                                 index=False)
+    else:
+        repeat_summary_rows = []
+        for rep in range(1, n_repeats + 1):
+            rep_data = results_df[results_df['repeat'] == rep]
+            row = {'repeat': rep}
+            for col in metric_cols:
+                row[col] = rep_data[col].mean()
+            repeat_summary_rows.append(row)
+        repeat_summary_df = pd.DataFrame(repeat_summary_rows)
+        mean_row_rep = {'repeat': 'MEAN'}
+        for col in metric_cols:
+            mean_row_rep[col] = repeat_summary_df[col].mean()
+        repeat_summary_df = pd.concat([repeat_summary_df, pd.DataFrame([mean_row_rep])],
+                                      ignore_index=True)
+        repeat_summary_df.to_csv(os.path.join(args.save_path, 'results_per_repeat.csv'),
+                                 index=False)
 
     if predictions_all_tasks:
         predictions_df = pd.concat(predictions_all_tasks, ignore_index=True)
@@ -443,6 +545,10 @@ if __name__ == '__main__':
     # Inference
     parser.add_argument('--n_repeats', type=int, default=1,
                         help='Number of evaluation repeats (default: 1)')
+    parser.add_argument('--eval_mode', type=str, default='fixed',
+                        choices=['fixed', 'cv'],
+                        help='fixed: usa fixed_val_*shots.csv (legacy); '
+                             'cv: K-fold CV sobre pool unificado support∪query')
     parser.add_argument('--batch_size', type=int, default=64,
                         help='Batch size for query_dataloader (default: 64)')
     parser.add_argument('--device', type=str, default='cuda:0',
