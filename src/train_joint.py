@@ -55,6 +55,7 @@ from src.helper import (
     load_checkpoint,
     init_model,
     init_opt)
+from src.sigreg import SigRegHookCollector
 from src.transforms import make_transforms
 
 # --
@@ -479,6 +480,35 @@ def main(args, resume_preempt=False):
     meta_batch_size = int(proto_cfg.get('meta_batch_size', 8))
     proto_warmup = int(proto_cfg.get('proto_warmup', warmup))  # default: same as I-JEPA warmup
 
+    # -- SIGREG (optional representation regularization)
+    sigreg_cfg = args.get('sigreg', {})
+    sigreg_enable = bool(sigreg_cfg.get('enable', False))
+    sigreg_alpha = float(sigreg_cfg.get('alpha', 0.1))
+    sigreg_sketch_dim = int(sigreg_cfg.get('sketch_dim', 64))
+    sigreg_warmup = int(sigreg_cfg.get('warmup_epochs', 0))
+    sigreg_target = str(sigreg_cfg.get('target', 'jepa_context_blocks'))
+    sigreg_representation = str(sigreg_cfg.get('representation', 'mean_tokens'))
+    sigreg_grad_clip_norm = sigreg_cfg.get('grad_clip_norm', None)
+    sigreg_loss_cap = sigreg_cfg.get('loss_cap', None)
+    sigreg_layer_ids = sigreg_cfg.get('layer_ids', None)
+    if sigreg_grad_clip_norm is not None:
+        sigreg_grad_clip_norm = float(sigreg_grad_clip_norm)
+    if sigreg_loss_cap is not None:
+        sigreg_loss_cap = float(sigreg_loss_cap)
+    if sigreg_enable:
+        if sigreg_target != 'jepa_context_blocks':
+            raise ValueError(
+                f'Invalid sigreg.target={sigreg_target!r}. '
+                "Only 'jepa_context_blocks' is supported.")
+        if not (0.0 <= sigreg_alpha <= 1.0):
+            raise ValueError(f'sigreg.alpha must be in [0, 1], got {sigreg_alpha}')
+        if sigreg_sketch_dim <= 0:
+            raise ValueError(f'sigreg.sketch_dim must be positive, got {sigreg_sketch_dim}')
+        if sigreg_representation not in {'mean_tokens', 'tokens'}:
+            raise ValueError(
+                f'Invalid sigreg.representation={sigreg_representation!r}. '
+                "Expected 'mean_tokens' or 'tokens'.")
+
     valid_proto_losses = {'mse', 'smooth_l1'}
     if proto_loss_type not in valid_proto_losses:
         raise ValueError(
@@ -534,6 +564,8 @@ def main(args, resume_preempt=False):
                            ('%.5f', 'loss'),
                            ('%.5f', 'loss_jepa'),
                            ('%.5f', 'loss_proto'),
+                           ('%.5f', 'loss_sigreg'),
+                           ('%.5f', 'alpha_sigreg'),
                            ('%.5f', 'mask-A'),
                            ('%.5f', 'mask-B'),
                            ('%d', 'time (ms)'))
@@ -724,6 +756,22 @@ def main(args, resume_preempt=False):
     for p in target_encoder.parameters():
         p.requires_grad = False
 
+    sigreg_collector = None
+    if sigreg_enable:
+        sigreg_collector = SigRegHookCollector(
+            encoder,
+            sketch_dim=sigreg_sketch_dim,
+            representation=sigreg_representation,
+            layer_ids=sigreg_layer_ids,
+        )
+        logger.info(
+            'Weak-SIGReg enabled: target=%s representation=%s alpha=%.4f '
+            'sketch_dim=%d warmup_epochs=%d grad_clip_norm=%s loss_cap=%s'
+            % (sigreg_target, sigreg_representation, sigreg_alpha,
+               sigreg_sketch_dim, sigreg_warmup, sigreg_grad_clip_norm,
+               sigreg_loss_cap)
+        )
+
     # -- momentum schedule
     # Accounts for interleaved ProtoNet EMA steps: ceil(n_tasks / meta_batch_size) per epoch
     n_proto_steps_per_epoch = math.ceil(len(proto_sampler) / meta_batch_size) if proto_sampler is not None else 0
@@ -771,7 +819,9 @@ def main(args, resume_preempt=False):
     def save_checkpoint(epoch, lambda_eff=0.0):
         nonlocal last_logged_artifact
         _loss_proto_avg = loss_proto_meter.avg
-        _loss_total = loss_jepa_meter.avg + lambda_eff * _loss_proto_avg
+        _loss_sigreg_avg = loss_sigreg_meter.avg
+        _loss_jepa_step_avg = loss_jepa_step_meter.avg
+        _loss_total = _loss_jepa_step_avg + lambda_eff * _loss_proto_avg
         save_dict = {
             'encoder': encoder.state_dict(),
             'predictor': predictor.state_dict(),
@@ -781,10 +831,13 @@ def main(args, resume_preempt=False):
             'epoch': epoch,
             'loss_jepa': loss_jepa_meter.avg,
             'loss_proto': _loss_proto_avg,
+            'loss_sigreg': _loss_sigreg_avg,
+            'loss_jepa_step': _loss_jepa_step_avg,
             'loss_total': _loss_total,
             'batch_size': batch_size,
             'world_size': world_size,
-            'lr': lr
+            'lr': lr,
+            'sigreg': sigreg_cfg,
         }
         if proto_projection is not None:
             save_dict['proto_projection'] = proto_projection.state_dict()
@@ -802,6 +855,8 @@ def main(args, resume_preempt=False):
                             metadata={'epoch': epoch + 1,
                                       'loss_jepa': loss_jepa_meter.avg,
                                       'loss_proto': _loss_proto_avg,
+                                      'loss_sigreg': _loss_sigreg_avg,
+                                      'loss_jepa_step': _loss_jepa_step_avg,
                                       'loss_total': _loss_total},
                         )
                         art.ttl = artifact_ttl
@@ -818,6 +873,8 @@ def main(args, resume_preempt=False):
                                 metadata={'epoch': epoch + 1,
                                           'loss_jepa': loss_jepa_meter.avg,
                                           'loss_proto': _loss_proto_avg,
+                                          'loss_sigreg': _loss_sigreg_avg,
+                                          'loss_jepa_step': _loss_jepa_step_avg,
                                           'loss_total': _loss_total,
                                           'ckpt_path': os.path.abspath(ckpt_path)},
                             )
@@ -877,6 +934,17 @@ def main(args, resume_preempt=False):
 
         return loss_accum / n_tasks
 
+    def _clip_optimizer_grad_norm(max_norm):
+        params = [
+            p
+            for group in optimizer.param_groups
+            for p in group['params']
+            if p.grad is not None
+        ]
+        if not params:
+            return 0.0
+        return float(torch.nn.utils.clip_grad_norm_(params, max_norm))
+
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
         logger.info('Epoch %d' % (epoch + 1))
@@ -884,7 +952,9 @@ def main(args, resume_preempt=False):
         unsupervised_sampler.set_epoch(epoch)
 
         loss_jepa_meter = AverageMeter()
+        loss_jepa_step_meter = AverageMeter()
         loss_proto_meter = AverageMeter()
+        loss_sigreg_meter = AverageMeter()
         maskA_meter = AverageMeter()
         maskB_meter = AverageMeter()
         time_meter = AverageMeter()
@@ -901,6 +971,14 @@ def main(args, resume_preempt=False):
                         % (epoch + 1, len(task_order), _n_proto_steps, proto_freq, lambda_eff))
         else:
             lambda_eff = lambda_proto
+
+        if sigreg_enable:
+            alpha_sigreg_eff = (
+                sigreg_alpha * min(1.0, (epoch + 1) / sigreg_warmup)
+                if sigreg_warmup > 0 else sigreg_alpha
+            )
+        else:
+            alpha_sigreg_eff = 0.0
 
         for itr, (udata, masks_enc, masks_pred) in enumerate(unsupervised_loader):
 
@@ -931,9 +1009,17 @@ def main(args, resume_preempt=False):
                         return h
 
                 def forward_context():
-                    z = encoder(imgs, masks_enc)
+                    if sigreg_collector is not None and alpha_sigreg_eff > 0.0:
+                        with sigreg_collector.capture():
+                            z = encoder(imgs, masks_enc)
+                        loss_sigreg = sigreg_collector.loss()
+                        if loss_sigreg is None:
+                            loss_sigreg = z.sum() * 0.0
+                    else:
+                        z = encoder(imgs, masks_enc)
+                        loss_sigreg = z.sum() * 0.0
                     z = predictor(z, masks_enc, masks_pred)
-                    return z
+                    return z, loss_sigreg
 
                 def jepa_loss_fn(z, h):
                     loss = F.smooth_l1_loss(z, h)
@@ -942,16 +1028,30 @@ def main(args, resume_preempt=False):
 
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
                     h = forward_target()
-                    z = forward_context()
+                    z, loss_sigreg = forward_context()
                     loss_jepa = jepa_loss_fn(z, h)
+                    loss_sigreg = AllReduce.apply(loss_sigreg)
+                    loss_sigreg_for_bp = (
+                        torch.clamp(loss_sigreg, max=sigreg_loss_cap)
+                        if sigreg_loss_cap is not None else loss_sigreg
+                    )
+                    loss_jepa_step = (
+                        (1.0 - alpha_sigreg_eff) * loss_jepa
+                        + alpha_sigreg_eff * loss_sigreg_for_bp
+                    )
 
                 # Backward & step
                 if use_bfloat16:
-                    scaler.scale(loss_jepa).backward()
+                    scaler.scale(loss_jepa_step).backward()
+                    if sigreg_grad_clip_norm is not None:
+                        scaler.unscale_(optimizer)
+                        _clip_optimizer_grad_norm(sigreg_grad_clip_norm)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    loss_jepa.backward()
+                    loss_jepa_step.backward()
+                    if sigreg_grad_clip_norm is not None:
+                        _clip_optimizer_grad_norm(sigreg_grad_clip_norm)
                     optimizer.step()
                 grad_stats = grad_logger(encoder.named_parameters())
                 optimizer.zero_grad()
@@ -962,25 +1062,41 @@ def main(args, resume_preempt=False):
                     for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
                         param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
 
-                return (float(loss_jepa), _new_lr, _new_wd, grad_stats)
+                return (
+                    float(loss_jepa),
+                    float(loss_sigreg),
+                    float(loss_jepa_step),
+                    _new_lr,
+                    _new_wd,
+                    grad_stats,
+                )
 
             result, etime = gpu_timer(train_step)
-            (loss_jepa_val, _new_lr, _new_wd, grad_stats) = result
+            (loss_jepa_val, loss_sigreg_val, loss_jepa_step_val,
+             _new_lr, _new_wd, grad_stats) = result
             loss_jepa_meter.update(loss_jepa_val)
+            loss_sigreg_meter.update(loss_sigreg_val)
+            loss_jepa_step_meter.update(loss_jepa_step_val)
             time_meter.update(etime)
 
             # -- Logging
             def log_stats():
-                csv_logger.log(epoch + 1, itr, loss_jepa_val, loss_jepa_val, loss_proto_meter.avg,
+                csv_logger.log(epoch + 1, itr, loss_jepa_step_val, loss_jepa_val,
+                               loss_proto_meter.avg, loss_sigreg_val, alpha_sigreg_eff,
                                maskA_meter.val, maskB_meter.val, etime)
-                if (itr % log_freq == 0) or np.isnan(loss_jepa_val) or np.isinf(loss_jepa_val):
-                    logger.info('[%d, %5d] loss_jepa: %.3f loss_proto: %.4f '
+                if (itr % log_freq == 0) or np.isnan(loss_jepa_step_val) or np.isinf(loss_jepa_step_val):
+                    logger.info('[%d, %5d] loss: %.3f loss_jepa: %.3f '
+                                'loss_sigreg: %.4f alpha_sigreg: %.4f '
+                                'loss_proto: %.4f '
                                 'masks: %.1f %.1f '
                                 '[wd: %.2e] [lr: %.2e] '
                                 '[mem: %.2e] '
                                 '(%.1f ms)'
                                 % (epoch + 1, itr,
+                                   loss_jepa_step_meter.avg,
                                    loss_jepa_meter.avg,
+                                   loss_sigreg_meter.avg,
+                                   alpha_sigreg_eff,
                                    loss_proto_meter.avg,
                                    maskA_meter.avg,
                                    maskB_meter.avg,
@@ -999,7 +1115,7 @@ def main(args, resume_preempt=False):
 
             log_stats()
 
-            assert not np.isnan(loss_jepa_val), 'loss is nan'
+            assert not np.isnan(loss_jepa_step_val), 'loss is nan'
 
             # ================================================================
             # Interleaved ProtoNet step (every proto_freq I-JEPA iterations)
@@ -1023,8 +1139,11 @@ def main(args, resume_preempt=False):
                 task_ptr = batch_end
 
         # -- Save Checkpoint after every epoch
-        logger.info('avg. loss_jepa %.3f  loss_proto %.4f  (lambda_eff=%.5f, %d proto steps)'
-                    % (loss_jepa_meter.avg, loss_proto_meter.avg, lambda_eff,
+        logger.info('avg. loss %.3f  loss_jepa %.3f  loss_sigreg %.4f  '
+                    'loss_proto %.4f  (alpha_sigreg=%.5f, lambda_eff=%.5f, %d proto steps)'
+                    % (loss_jepa_step_meter.avg, loss_jepa_meter.avg,
+                       loss_sigreg_meter.avg, loss_proto_meter.avg,
+                       alpha_sigreg_eff, lambda_eff,
                        _n_proto_steps if proto_sampler is not None else 0))
         save_checkpoint(epoch+1, lambda_eff=lambda_eff)
 
@@ -1032,9 +1151,12 @@ def main(args, resume_preempt=False):
         if rank == 0:
             wandb_log = {
                 'train/loss_jepa': loss_jepa_meter.avg,
+                'train/loss_jepa_step': loss_jepa_step_meter.avg,
+                'train/loss_sigreg': loss_sigreg_meter.avg,
                 'train/loss_proto': loss_proto_meter.avg,
-                'train/loss_total': loss_jepa_meter.avg + lambda_eff * loss_proto_meter.avg,
+                'train/loss_total': loss_jepa_step_meter.avg + lambda_eff * loss_proto_meter.avg,
                 'train/lambda_proto': lambda_eff,
+                'train/alpha_sigreg': alpha_sigreg_eff,
                 'train/mask_a': maskA_meter.avg,
                 'train/mask_b': maskB_meter.avg,
                 'train/lr': _new_lr,
@@ -1081,7 +1203,14 @@ def main(args, resume_preempt=False):
         art = wandb.Artifact(
             f'{tag}-checkpoint-latest',
             type='model',
-            metadata={'epoch': num_epochs, 'loss': loss_jepa_meter.avg},
+            metadata={
+                'epoch': num_epochs,
+                'loss_jepa': loss_jepa_meter.avg,
+                'loss_sigreg': loss_sigreg_meter.avg,
+                'loss_jepa_step': loss_jepa_step_meter.avg,
+                'loss_proto': loss_proto_meter.avg,
+                'loss_total': loss_jepa_step_meter.avg + lambda_eff * loss_proto_meter.avg,
+            },
         )
         art.add_reference(f'file://{os.path.abspath(latest_path)}')
         wandb.log_artifact(art)

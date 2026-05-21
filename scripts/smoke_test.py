@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from src.helper import init_model
 from src.masks.multiblock import MaskCollator
 from src.masks.utils import apply_masks
+from src.sigreg import SigRegHookCollector, weak_sigreg_loss
 from src.utils.tensors import repeat_interleave_batch
 
 # ---------------------------------------------------------------------------
@@ -137,5 +138,35 @@ assert z.shape[2] == embed_dim, \
 
 assert math.isfinite(loss.item()), \
     f"Loss is not finite: {loss.item()}"
+
+# ---------------------------------------------------------------------------
+# 7. Weak-SIGReg smoke test on context encoder block activations
+# ---------------------------------------------------------------------------
+encoder.zero_grad(set_to_none=True)
+sigreg_collector = SigRegHookCollector(
+    encoder,
+    sketch_dim=64,
+    representation='mean_tokens',
+)
+with sigreg_collector.capture():
+    _ = encoder(imgs, masks_enc)
+loss_sigreg = sigreg_collector.loss()
+sigreg_collector.close()
+
+print(f"\n[7] weak-sigreg loss: {loss_sigreg.item():.6f}")
+
+assert math.isfinite(loss_sigreg.item()), \
+    f"SIGReg loss is not finite: {loss_sigreg.item()}"
+
+loss_sigreg.backward()
+has_sigreg_grad = any(
+    p.grad is not None and torch.isfinite(p.grad).all()
+    for p in encoder.parameters()
+)
+assert has_sigreg_grad, "SIGReg backward produced no finite encoder gradients"
+
+direct_sigreg = weak_sigreg_loss(torch.randn(8, embed_dim, device=device), 64)
+assert math.isfinite(direct_sigreg.item()), \
+    f"Direct SIGReg loss is not finite: {direct_sigreg.item()}"
 
 print("\nAll checks passed.")

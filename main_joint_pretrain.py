@@ -64,6 +64,18 @@ parser.add_argument('--start_lr', type=float, default=None,
                     help='Override optimization.start_lr')
 parser.add_argument('--final_lr', type=float, default=None,
                     help='Override optimization.final_lr')
+parser.add_argument('--sigreg', action='store_true',
+                    help='Enable Weak-SIGReg regularization')
+parser.add_argument('--sigreg_alpha', type=float, default=None,
+                    help='Override sigreg.alpha')
+parser.add_argument('--sigreg_sketch_dim', type=int, default=None,
+                    help='Override sigreg.sketch_dim')
+parser.add_argument('--sigreg_warmup', type=int, default=None,
+                    help='Override sigreg.warmup_epochs')
+parser.add_argument('--sigreg_grad_clip_norm', type=float, default=None,
+                    help='Override sigreg.grad_clip_norm')
+parser.add_argument('--sigreg_loss_cap', type=float, default=None,
+                    help='Override sigreg.loss_cap: clamp raw sigreg loss before alpha weighting')
 
 
 def apply_overrides(params, args):
@@ -111,6 +123,18 @@ def apply_overrides(params, args):
         params.setdefault('protonet', {})['proto_warmup'] = args.proto_warmup
     if args.proto_loss_type is not None:
         params.setdefault('protonet', {})['loss_type'] = args.proto_loss_type
+    if args.sigreg:
+        params.setdefault('sigreg', {})['enable'] = True
+    if args.sigreg_alpha is not None:
+        params.setdefault('sigreg', {})['alpha'] = args.sigreg_alpha
+    if args.sigreg_sketch_dim is not None:
+        params.setdefault('sigreg', {})['sketch_dim'] = args.sigreg_sketch_dim
+    if args.sigreg_warmup is not None:
+        params.setdefault('sigreg', {})['warmup_epochs'] = args.sigreg_warmup
+    if args.sigreg_grad_clip_norm is not None:
+        params.setdefault('sigreg', {})['grad_clip_norm'] = args.sigreg_grad_clip_norm
+    if args.sigreg_loss_cap is not None:
+        params.setdefault('sigreg', {})['loss_cap'] = args.sigreg_loss_cap
     return params
 
 
